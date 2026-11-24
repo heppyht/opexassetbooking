@@ -10,6 +10,3 @@ GEOTAB_DATABASE=opex_trial
 # GEOTAB_SERVICE_USERNAME
 # GEOTAB_SERVICE_PASSWORD
 # GEOTAB_SERVICE_SERVER
-
-# JWT secret for signing authorization tokens (set via `wrangler secret put`):
-# AUTHZ_JWT_SECRET

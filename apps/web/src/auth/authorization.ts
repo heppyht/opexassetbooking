@@ -41,7 +41,8 @@ export type BookingAction =
   | "assign_driver"
   | "complete_booking"
   | "cancel_booking"
-  | "view_all_bookings";
+  | "view_all_bookings"
+  | "view_security_dashboard";
 
 export function canPerformAction(
   action: BookingAction,
@@ -65,6 +66,8 @@ export function canPerformAction(
       return roles.some(r => roleHasMinRank(r, "EMPLOYEE"));
     case "view_all_bookings":
       return roles.some(r => roleHasMinRank(r, "EMPLOYEE"));
+    case "view_security_dashboard":
+      return roles.some(r => roleHasMinRank(r, "ADMIN"));
     default:
       return false;
   }
@@ -76,6 +79,8 @@ export function getRequiredRole(action: BookingAction): UserRole {
     case "reject_booking":
     case "assign_driver":
       return "APPROVER";
+    case "view_security_dashboard":
+      return "ADMIN";
     default:
       return "EMPLOYEE";
   }

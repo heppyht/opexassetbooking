@@ -69,7 +69,7 @@ export interface BookingValidationResult {
    entity store. Every persistent record carries recordType and
    schemaVersion so the client can normalize legacy records and evolve
    the schema without server-side migrations. */
-export type RecordType = "booking" | "booking_audit" | "notification" | "vehicle_hold" | "audit_dead_letter";
+export type RecordType = "booking" | "booking_audit" | "notification" | "vehicle_hold" | "audit_dead_letter" | "reconciliation_finding";
 
 export const SCHEMA_VERSION = 1;
 
@@ -308,6 +308,63 @@ export interface AuditReconciliationResult {
   missing_audit_actions: string[];
   last_audit_action: string | null;
   last_audit_timestamp: string | null;
+}
+
+/*───────────────────── Reconciliation Finding Types ─────────────────────*/
+/* Classification of reconciliation findings. Distinguishes between
+   legitimate partial writes, interrupted application operations,
+   potential unauthorized direct writes, and insufficient evidence. */
+export type ReconciliationFindingType =
+  | "MISSING_AUDIT_EVENT"
+  | "UNEXPECTED_STATUS_TRANSITION"
+  | "INVALID_ACTOR_ATTRIBUTION"
+  | "VERSION_MISMATCH"
+  | "DUPLICATE_BOOKING_RECORD"
+  | "RECORD_MODIFIED_WITHOUT_AUDIT"
+  | "RECORD_DELETED_WITHOUT_AUDIT"
+  | "NOTIFICATION_MANIPULATION"
+  | "INCONSISTENT_BOOKING_STATE"
+  | "INSUFFICIENT_EVIDENCE";
+
+export type ReconciliationSeverity = "LOW" | "MEDIUM" | "HIGH" | "CRITICAL";
+
+export type ReconciliationStatus = "OPEN" | "INVESTIGATING" | "RESOLVED" | "FALSE_POSITIVE";
+
+/* A structured reconciliation finding. Stored in AddInData as recordType
+   "reconciliation_finding" and exposed through the security monitoring
+   dashboard. Original audit evidence is never overwritten. */
+export interface OpexReconciliationFinding {
+  recordType: RecordType;
+  schemaVersion: number;
+  id: string;
+  finding_id: string;
+  booking_id: string;
+  finding_type: ReconciliationFindingType;
+  severity: ReconciliationSeverity;
+  expected_state: string | null;
+  observed_state: string | null;
+  detection_timestamp: string;
+  related_audit_references: string[];
+  reconciliation_status: ReconciliationStatus;
+  evidence_classification: "LEGITIMATE_PARTIAL_WRITE" | "INTERRUPTED_OPERATION" | "POTENTIAL_UNAUTHORIZED_WRITE" | "INSUFFICIENT_EVIDENCE";
+  notes: string | null;
+}
+
+/*───────────────────── Reconciliation State (Service Add-In) ─────────────────────*/
+/* Tracks reconciliation run state for the Service Add-In. Stored in
+   localStorage to prevent overlapping runs within the same instance.
+   NOTE: localStorage does not provide atomic distributed locking — it is
+   a best-effort, single-origin mechanism shared across tabs. */
+export interface ReconciliationRunState {
+  last_successful_reconciliation: string | null;
+  last_error: string | null;
+  last_error_timestamp: string | null;
+  last_run_timestamp: string | null;
+  reconciliation_in_progress: boolean;
+  total_findings: number;
+  open_findings: number;
+  lock_owner: string | null;
+  lock_acquired_at: string | null;
 }
 
 /*───────────────────── Notification Provider Interface ─────────────────────*/

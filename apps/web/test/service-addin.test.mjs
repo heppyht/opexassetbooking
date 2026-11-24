@@ -9,6 +9,12 @@ import {
   NotificationRateLimiter,
   getAddInId,
   deliverPendingNotifications,
+  runReconciliation,
+  readReconciliationState,
+  markReconciliationInProgress,
+  markReconciliationComplete,
+  isLockStale,
+  recoverStaleLock,
 } from "../src/serviceAddin.ts";
 import {
   DEFAULT_ADDIN_ID,
@@ -359,4 +365,126 @@ test("AddInId validation: rejects invalid values", () => {
 
 test("AddInId consistency: Custom-page and Service Add-In use same DEFAULT_ADDIN_ID", () => {
   assert.equal(DEFAULT_ADDIN_ID, "aDJjMmVmZWMtYzU1OC00MTJ", "Custom-page DEFAULT_ADDIN_ID should match");
+});
+
+/*───────────────────── Reconciliation Lock TTL Tests ─────────────────────*/
+
+function makeFreshState() {
+  return {
+    last_successful_reconciliation: null,
+    last_error: null,
+    last_error_timestamp: null,
+    last_run_timestamp: null,
+    reconciliation_in_progress: false,
+    total_findings: 0,
+    open_findings: 0,
+    lock_owner: null,
+    lock_acquired_at: null,
+  };
+}
+
+function makeStaleState() {
+  const staleTime = new Date(Date.now() - 600000).toISOString(); // 10 minutes ago
+  return {
+    ...makeFreshState(),
+    reconciliation_in_progress: true,
+    lock_owner: "other-owner",
+    lock_acquired_at: staleTime,
+  };
+}
+
+function makeFreshLockState() {
+  const now = new Date().toISOString();
+  return {
+    ...makeFreshState(),
+    reconciliation_in_progress: true,
+    lock_owner: "current-owner",
+    lock_acquired_at: now,
+  };
+}
+
+test("lock: isLockStale returns false for null state", () => {
+  assert.equal(isLockStale(null), false);
+});
+
+test("lock: isLockStale returns false for state with no lock", () => {
+  assert.equal(isLockStale(makeFreshState()), false);
+});
+
+test("lock: isLockStale returns true for stale lock (10 minutes old)", () => {
+  assert.equal(isLockStale(makeStaleState()), true);
+});
+
+test("lock: isLockStale returns false for fresh lock", () => {
+  assert.equal(isLockStale(makeFreshLockState()), false);
+});
+
+test("lock: isLockStale returns false when reconciliation_in_progress is false", () => {
+  const state = makeStaleState();
+  state.reconciliation_in_progress = false;
+  assert.equal(isLockStale(state), false);
+});
+
+test("lock: recoverStaleLock returns false when no lock exists", async () => {
+  const calls = [];
+  const localStorage = {
+    get: async () => null,
+    set: async (k, v) => { calls.push({ k, v }); },
+  };
+  const recovered = await recoverStaleLock(localStorage);
+  assert.equal(recovered, false);
+});
+
+test("lock: recoverStaleLock returns false when lock is fresh", async () => {
+  const calls = [];
+  const localStorage = {
+    get: async () => JSON.stringify(makeFreshLockState()),
+    set: async (k, v) => { calls.push({ k, v }); },
+  };
+  const recovered = await recoverStaleLock(localStorage);
+  assert.equal(recovered, false);
+  assert.equal(calls.length, 0);
+});
+
+test("lock: recoverStaleLock clears stale lock", async () => {
+  const calls = [];
+  const localStorage = {
+    get: async () => JSON.stringify(makeStaleState()),
+    set: async (k, v) => { calls.push({ k, v }); },
+  };
+  const recovered = await recoverStaleLock(localStorage);
+  assert.equal(recovered, true);
+  assert.equal(calls.length, 1);
+  const saved = JSON.parse(calls[0].v);
+  assert.equal(saved.reconciliation_in_progress, false);
+  assert.equal(saved.lock_owner, null);
+  assert.equal(saved.lock_acquired_at, null);
+});
+
+test("lock: markReconciliationInProgress sets lock_owner and lock_acquired_at", async () => {
+  const calls = [];
+  const localStorage = {
+    get: async () => null,
+    set: async (k, v) => { calls.push({ k, v }); },
+  };
+  await markReconciliationInProgress(localStorage);
+  assert.equal(calls.length, 1);
+  const saved = JSON.parse(calls[0].v);
+  assert.equal(saved.reconciliation_in_progress, true);
+  assert.ok(saved.lock_owner);
+  assert.ok(saved.lock_acquired_at);
+  assert.ok(saved.lock_owner.startsWith("owner-"));
+});
+
+test("lock: markReconciliationComplete clears lock_owner and lock_acquired_at", async () => {
+  const calls = [];
+  const localStorage = {
+    get: async () => JSON.stringify(makeFreshLockState()),
+    set: async (k, v) => { calls.push({ k, v }); },
+  };
+  await markReconciliationComplete(localStorage, { totalFindings: 0, openFindings: 0 });
+  const saved = JSON.parse(calls[calls.length - 1].v);
+  assert.equal(saved.reconciliation_in_progress, false);
+  assert.equal(saved.lock_owner, null);
+  assert.equal(saved.lock_acquired_at, null);
 });

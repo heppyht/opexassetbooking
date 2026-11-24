@@ -1,6 +1,6 @@
 import { useState, useCallback, useEffect, useMemo, useRef } from "react";
 import { bookingDataProvider } from "../data/dataProvider";
-import type { ResolvedAsset, ResolvedBooking, ResolvedUser, BookingDataProvider, OpexNotification, NotificationType, NotificationDataProvider } from "../data/types";
+import type { ResolvedAsset, ResolvedBooking, ResolvedUser, BookingDataProvider, OpexNotification, NotificationType, NotificationDataProvider, OpexReconciliationFinding, ReconciliationFindingType, ReconciliationSeverity, ReconciliationStatus, ReconciliationRunState } from "../data/types";
 import { createAddInDataProvider } from "../data/addinDataProvider";
 import { createNotificationEngine } from "../data/notificationService";
 import { useAutoRefresh } from "./autoRefresh";
@@ -21,7 +21,7 @@ import {
   canPerformAction,
   type BookingAction,
 } from "../auth/authorization";
-import { ServerAuthzClient } from "../auth/serverAuthzClient";
+import { ServerAuthzClient, ServerAuthzError } from "../auth/serverAuthzClient";
 import { canRunDemoOnlyOperation, assertDemoOnlyOperation, assertProviderNotLiveForDemoOperation, getStateResetOnModeSwitch, isKnownMode } from "../safety/modeGuards";
 import { emitAuditEvent, snapshotBooking, type AuditAction } from "../audit/auditTrail";
 import { getTenantTimezone, toTenantLocalParts, toIsoFromTenantParts, formatTenantDateTime } from "../config/tenantTimezone";
@@ -109,6 +109,7 @@ const NAV_ITEMS: Array<{ key: string; label: string }> = [
   { key: "Notifications", label: "Notifications" },
   { key: "Asset Availability", label: "Asset Availability" },
   { key: "Booking Reports", label: "Booking Reports" },
+  { key: "Security Dashboard", label: "Security Dashboard" },
 ];
 
 /*───────────────────── Helpers ─────────────────────*/
@@ -1790,6 +1791,296 @@ function ViewDetailsModal({
   );
 }
 
+/*───────────────────── Security Dashboard ─────────────────────*/
+
+function severityBadge(severity: ReconciliationSeverity) {
+  const map: Record<ReconciliationSeverity, string> = {
+    CRITICAL: "#DC2626",
+    HIGH: "#EA580C",
+    MEDIUM: "#D97706",
+    LOW: "#6B7280",
+  };
+  return (
+    <span
+      style={{
+        display: "inline-block",
+        padding: "2px 8px",
+        borderRadius: "12px",
+        fontSize: "10px",
+        fontWeight: 600,
+        color: "#fff",
+        background: map[severity],
+        textTransform: "uppercase",
+        letterSpacing: "0.05em",
+      }}
+    >
+      {severity}
+    </span>
+  );
+}
+
+function statusBadge(status: ReconciliationStatus) {
+  const map: Record<ReconciliationStatus, string> = {
+    OPEN: "#EF4444",
+    INVESTIGATING: "#F59E0B",
+    RESOLVED: "#10B981",
+    FALSE_POSITIVE: "#6B7280",
+  };
+  return (
+    <span
+      style={{
+        display: "inline-block",
+        padding: "2px 8px",
+        borderRadius: "12px",
+        fontSize: "10px",
+        fontWeight: 600,
+        color: "#fff",
+        background: map[status],
+        textTransform: "uppercase",
+        letterSpacing: "0.05em",
+      }}
+    >
+      {status}
+    </span>
+  );
+}
+
+function findingTypeLabel(type: ReconciliationFindingType) {
+  return type.replace(/_/g, " ");
+}
+
+function SecurityDashboard({
+  findings,
+  runState,
+  loading,
+  onRefresh,
+  addInId,
+  geotabApi,
+  addToast,
+  mode,
+}: {
+  findings: OpexReconciliationFinding[];
+  runState: ReconciliationRunState | null;
+  loading: boolean;
+  onRefresh: () => void;
+  addInId: string | null;
+  geotabApi: GeotabApi | null;
+  addToast: (type: Toast["type"], text: string) => void;
+  mode: AppMode;
+}) {
+  const openCount = findings.filter(f => f.reconciliation_status === "OPEN").length;
+  const criticalCount = findings.filter(f => f.severity === "CRITICAL").length;
+  const highCount = findings.filter(f => f.severity === "HIGH").length;
+
+  const byType = findings.reduce<Record<string, number>>((acc, f) => {
+    acc[f.finding_type] = (acc[f.finding_type] || 0) + 1;
+    return acc;
+  }, {});
+
+  const bySeverity = findings.reduce<Record<string, number>>((acc, f) => {
+    acc[f.severity] = (acc[f.severity] || 0) + 1;
+    return acc;
+  }, {});
+
+  const isLiveMode = mode === "ADDIN_DATA";
+  const canReconcile = isLiveMode && !!geotabApi && !!addInId;
+
+  return (
+    <div className="page">
+      <PageHeader
+        eyebrow="Security & Audit Integrity"
+        title="Security Dashboard"
+        subtitle="Reconciliation findings detected by the AddInData audit reconciliation engine. Findings are advisory and do not modify original audit records."
+      />
+
+      {/* Mode notice */}
+      {!canReconcile && (
+        <div className="notice error">
+          Reconciliation requires ADDIN_DATA mode with a configured AddInId and MyGeotab API access.
+        </div>
+      )}
+
+      <section className="stats">
+        <StatCard
+          label="Total Findings"
+          value={findings.length}
+          sub="Reconciliation findings detected"
+          trend={{
+            dir: criticalCount > 0 || highCount > 0 ? "up" : "neutral",
+            label: `${criticalCount} critical · ${highCount} high`,
+          }}
+        />
+        <StatCard
+          label="Open Findings"
+          value={openCount}
+          sub="Requiring review"
+          trend={{ dir: openCount > 0 ? "up" : "neutral", label: "Not yet resolved" }}
+        />
+        <StatCard
+          label="Last Run"
+          value={runState?.last_successful_reconciliation ? new Date(runState.last_successful_reconciliation).toLocaleString() : "—"}
+          sub={runState?.reconciliation_in_progress ? "In progress" : runState?.last_error ? "Last run had errors" : "No runs recorded"}
+        />
+        <StatCard
+          label="Evidence Classification"
+          value={runState?.total_findings || 0}
+          sub="Findings stored in AddInData"
+        />
+      </section>
+
+      <div className="dashboard-actions" style={{ display: "flex", gap: 12, marginBottom: 24, flexWrap: "wrap" }}>
+        <button
+          className="btn btn-primary"
+          onClick={onRefresh}
+          disabled={loading || !canReconcile}
+        >
+          {loading ? "Reconciling…" : "Run Reconciliation Now"}
+        </button>
+        <button
+          className="btn btn-secondary"
+          onClick={() => {
+            const unresolved = findings.filter(f => f.reconciliation_status === "OPEN");
+            addToast(
+              "warn",
+              `${unresolved.length} open finding(s) require administrator review. Original audit records are never modified by this process.`,
+            );
+          }}
+        >
+          Review Guidance
+        </button>
+      </div>
+
+      {findings.length === 0 && !loading && (
+        <EmptyState
+          title="No reconciliation findings"
+          message={canReconcile ? "Run reconciliation to scan for audit integrity anomalies." : "Switch to ADDIN_DATA mode to enable reconciliation."}
+          action={canReconcile ? { label: "Run Reconciliation", onClick: onRefresh } : undefined}
+        />
+      )}
+
+      {loading && (
+        <LoadingState message="Running reconciliation scan…" />
+      )}
+
+      {findings.length > 0 && (
+        <section className="panel">
+          <div className="panel-head">
+            <div className="panel-head-content">
+              <h2>Reconciliation Findings</h2>
+              <p>Each finding represents a detected anomaly between booking records and audit trail. Severity indicates potential security impact.</p>
+            </div>
+            <div className="panel-head-actions">
+              <span className="badge badge-pending">{openCount} open</span>
+              <button className="btn btn-secondary btn-sm" onClick={onRefresh}>Refresh</button>
+            </div>
+          </div>
+          <div className="panel-body">
+            <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fill, minmax(240px, 1fr))", gap: 14, marginBottom: 16 }}>
+              {Object.entries(bySeverity).map(([sev, count]) => (
+                <div key={sev} className="stat-card" style={{ borderLeft: `4px solid ${sev === "CRITICAL" ? "#DC2626" : sev === "HIGH" ? "#EA580C" : sev === "MEDIUM" ? "#D97706" : "#6B7280"}` }}>
+                  <div className="stat-label">{sev} Severity</div>
+                  <div className="stat-value">{count}</div>
+                  <div className="stat-sub">findings</div>
+                </div>
+              ))}
+              {Object.entries(byType).map(([type, count]) => (
+                <div key={type} className="stat-card" style={{ borderLeft: "4px solid #2563EB" }}>
+                  <div className="stat-label">{findingTypeLabel(type as ReconciliationFindingType)}</div>
+                  <div className="stat-value">{count}</div>
+                  <div className="stat-sub">findings</div>
+                </div>
+              ))}
+            </div>
+
+            <div className="table-wrap">
+              <table className="data-table">
+                <thead>
+                  <tr>
+                    <th>Finding ID</th><th>Booking ID</th><th>Type</th><th>Severity</th><th>Status</th><th>Detected</th><th>Evidence</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {findings.map(f => (
+                    <tr key={f.finding_id}>
+                      <td style={{ fontFamily: "monospace", fontSize: 11 }}>{f.finding_id}</td>
+                      <td style={{ fontFamily: "monospace", fontSize: 11 }}>{f.booking_id}</td>
+                      <td>{findingTypeLabel(f.finding_type)}</td>
+                      <td>{severityBadge(f.severity)}</td>
+                      <td>{statusBadge(f.reconciliation_status)}</td>
+                      <td style={{ fontSize: 11, color: "#6B7280" }}>{new Date(f.detection_timestamp).toLocaleString()}</td>
+                      <td>{f.evidence_classification}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+
+            <div style={{ marginTop: 16, padding: 12, background: "#F8FAFC", border: "1px solid var(--border)", borderRadius: "var(--radius)", fontSize: 12, color: "#4B5563" }}>
+              <p style={{ margin: 0, marginBottom: 8, fontWeight: 600 }}>How to interpret findings:</p>
+              <ul style={{ margin: 0, paddingLeft: 18, fontSize: 12, color: "#4B5563" }}>
+                <li><b>MISSING_AUDIT_EVENT:</b> A booking exists but expected audit events are absent. May indicate interrupted writes or direct AddInData modifications.</li>
+                <li><b>UNEXPECTED_STATUS_TRANSITION:</b> An audit record shows a status transition not permitted by the state machine. Potential unauthorized state change.</li>
+                <li><b>INVALID_ACTOR_ATTRIBUTION:</b> An audit record attributes an action to a user other than the booking requester (excluding approvals/driver assignments).</li>
+                <li><b>VERSION_MISMATCH:</b> Booking version is inconsistent with audit record count.</li>
+                <li><b>DUPLICATE_BOOKING_RECORD:</b> Multiple booking records share the same ID.</li>
+                <li><b>RECORD_DELETED_WITHOUT_AUDIT:</b> An audit record references a booking that no longer exists.</li>
+                <li><b>NOTIFICATION_MANIPULATION:</b> A notification references a non-existent booking.</li>
+                <li><b>INCONSISTENT_BOOKING_STATE:</b> Booking status lacks required supporting audit events.</li>
+                <li><b>INSUFFICIENT_EVIDENCE:</b> Cannot determine cause — requires manual investigation.</li>
+              </ul>
+              <p style={{ margin: 8, marginTop: 12, fontSize: 11, color: "#9CA3AF" }}>
+                Important: AddInData allows direct Add/Set/Get/Remove via browser console. Application-level RBAC cannot prevent direct API access. Findings indicate potential issues but do not prove malicious intent — interrupted operations and legitimate partial writes produce similar signals.
+              </p>
+            </div>
+          </div>
+        </section>
+      )}
+
+      {runState && (
+        <section className="panel">
+          <div className="panel-head">
+            <div className="panel-head-content">
+              <h2>Reconciliation Run State</h2>
+              <p>Tracked in localStorage to prevent overlapping runs within the same Service Add-In instance.</p>
+            </div>
+          </div>
+          <div className="panel-body">
+            <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fill, minmax(240px, 1fr))", gap: 14 }}>
+              <div className="stat-card">
+                <div className="stat-label">Last Successful</div>
+                <div className="stat-value">{runState.last_successful_reconciliation ? new Date(runState.last_successful_reconciliation).toLocaleString() : "—"}</div>
+                <div className="stat-sub">reconciliation</div>
+              </div>
+              <div className="stat-card">
+                <div className="stat-label">Total Findings</div>
+                <div className="stat-value">{runState.total_findings}</div>
+                <div className="stat-sub">across all runs</div>
+              </div>
+              <div className="stat-card">
+                <div className="stat-label">Open Findings</div>
+                <div className="stat-value">{runState.open_findings}</div>
+                <div className="stat-sub">unresolved</div>
+              </div>
+              <div className="stat-card">
+                <div className="stat-label">In Progress</div>
+                <div className="stat-value">{runState.reconciliation_in_progress ? "Yes" : "No"}</div>
+                <div className="stat-sub">current run state</div>
+              </div>
+              {runState.last_error && (
+                <div className="stat-card" style={{ borderLeft: "4px solid #DC2626" }}>
+                  <div className="stat-label">Last Error</div>
+                  <div className="stat-value" style={{ fontSize: 11 }}>{runState.last_error}</div>
+                  <div className="stat-sub">{runState.last_error_timestamp ? new Date(runState.last_error_timestamp).toLocaleString() : ""}</div>
+                </div>
+              )}
+            </div>
+          </div>
+        </section>
+      )}
+    </div>
+  );
+}
+
 /*───────────────────── Main App ─────────────────────*/
 
 export default function App() {
@@ -1871,6 +2162,11 @@ export default function App() {
   const [providerError, setProviderError] = useState<string | null>(null);
   const [notifications, setNotifications] = useState<OpexNotification[]>([]);
   const [notificationDropdownOpen, setNotificationDropdownOpen] = useState(false);
+  const [reconciliationFindings, setReconciliationFindings] = useState<OpexReconciliationFinding[]>([]);
+  const [reconciliationRunState, setReconciliationRunState] = useState<ReconciliationRunState | null>(null);
+  const [reconciliationLoading, setReconciliationLoading] = useState(false);
+  const [securityDashboardAuthorized, setSecurityDashboardAuthorized] = useState<boolean | null>(null);
+  const [securityDashboardAuthError, setSecurityDashboardAuthError] = useState<string | null>(null);
 
   const isLiveMode = mode === "ADDIN_DATA";
   const liveBlockedReason = getLiveBlockedReason(mode, identityState);
@@ -2116,6 +2412,110 @@ export default function App() {
     }
   }, [provider, mode, geotabApi, addInId, identityState, demoActor, notificationEngine]);
 
+  const loadReconciliationFindings = useCallback(async () => {
+    if (mode !== "ADDIN_DATA" || !geotabApi || !addInId) {
+      setReconciliationFindings([]);
+      setReconciliationRunState(null);
+      setReconciliationLoading(false);
+      return;
+    }
+    /* Protect findings retrieval: only authorized users may read reconciliation data */
+    if (securityDashboardAuthorized !== true) {
+      setReconciliationFindings([]);
+      setReconciliationRunState(null);
+      setReconciliationLoading(false);
+      return;
+    }
+    setReconciliationLoading(true);
+    try {
+      const call = geotabApi?.call;
+      if (typeof call !== "function") {
+        setReconciliationFindings([]);
+        setReconciliationRunState(null);
+        setReconciliationLoading(false);
+        return;
+      }
+      const records = await new Promise<unknown>((resolve, reject) => {
+        call("Get", {
+          typeName: "AddInData",
+          search: {
+            addInId,
+            whereClause: 'details.recordType = "reconciliation_finding"',
+            resultsLimit: 100,
+          },
+        }, resolve, reject);
+      });
+      if (records) {
+        const findings: OpexReconciliationFinding[] = [];
+        for (const rec of records as Array<{ details?: unknown; id?: string }>) {
+          const details = rec.details as OpexReconciliationFinding | undefined;
+          if (details && details.recordType === "reconciliation_finding") {
+            findings.push({ ...details, id: rec.id ?? details.id });
+          }
+        }
+        findings.sort((a, b) => new Date(b.detection_timestamp).getTime() - new Date(a.detection_timestamp).getTime());
+        setReconciliationFindings(findings);
+      }
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : "Failed to load reconciliation findings.";
+      setMessage({ type: "error", text: msg });
+      setProviderError(msg);
+    } finally {
+      setReconciliationLoading(false);
+    }
+  }, [mode, geotabApi, addInId, securityDashboardAuthorized]);
+
+  /* Verify Security Dashboard authorization through the trusted server.
+     Falls back to client-side role check when serverAuthz is not configured. */
+  const verifySecurityDashboardAuthorization = useCallback(async () => {
+    if (mode !== "ADDIN_DATA") {
+      setSecurityDashboardAuthorized(false);
+      setSecurityDashboardAuthError("Security dashboard requires ADDIN_DATA mode.");
+      return;
+    }
+    /* Client-side defense-in-depth: ADMIN role required */
+    const clientAuthorized = verifiedPrincipal
+      ? verifiedPrincipal.roles.includes("ADMIN")
+      : false;
+    if (!clientAuthorized) {
+      setSecurityDashboardAuthorized(false);
+      setSecurityDashboardAuthError("Access denied: ADMIN role required for Security Dashboard.");
+      return;
+    }
+    /* Server-side verification when the trusted Worker is configured */
+    if (serverAuthz && verifiedPrincipal && identityState.session) {
+      try {
+        const result = await serverAuthz.authorize(
+          identityState.session.sessionId ?? "",
+          identityState.session.database ?? "",
+          identityState.session.server ?? "",
+          "view_security_dashboard",
+        );
+        if (result.authorized) {
+          setSecurityDashboardAuthorized(true);
+          setSecurityDashboardAuthError(null);
+        } else {
+          setSecurityDashboardAuthorized(false);
+          setSecurityDashboardAuthError(`Server authorization denied: ${result.reason}`);
+        }
+      } catch (e) {
+        const status = e instanceof ServerAuthzError ? e.status : 0;
+        if (status === 401 || status === 403) {
+          setSecurityDashboardAuthorized(false);
+          setSecurityDashboardAuthError("Session invalid or expired. Please re-authenticate.");
+        } else {
+          /* Server unavailable — fall back to client-side check only */
+          setSecurityDashboardAuthorized(clientAuthorized);
+          setSecurityDashboardAuthError(clientAuthorized ? null : "Access denied: ADMIN role required.");
+        }
+      }
+    } else {
+      /* No server configured — client-side check only */
+      setSecurityDashboardAuthorized(clientAuthorized);
+      setSecurityDashboardAuthError(clientAuthorized ? null : "Access denied: ADMIN role required.");
+    }
+  }, [mode, serverAuthz, verifiedPrincipal, identityState.session]);
+
   // Refresh notifications when actor context changes
   useEffect(() => {
     if (!actorId || !notificationEngine) return;
@@ -2128,6 +2528,23 @@ export default function App() {
     }).catch(() => {});
     return () => { mounted = false; };
   }, [actorId, notificationEngine]);
+
+  // Load reconciliation findings when bookings/data load
+  useEffect(() => {
+    let mounted = true;
+    if (mode === "ADDIN_DATA" && geotabApi && addInId) {
+      loadReconciliationFindings().catch(() => {});
+    } else {
+      setReconciliationFindings([]);
+      setReconciliationRunState(null);
+    }
+    return () => { mounted = false; };
+  }, [mode, geotabApi, addInId, loadReconciliationFindings]);
+
+  // Verify Security Dashboard authorization when identity/session changes
+  useEffect(() => {
+    verifySecurityDashboardAuthorization().catch(() => {});
+  }, [mode, verifiedPrincipal, identityState.session, serverAuthz, verifySecurityDashboardAuthorization]);
 
   const onResetDemoData = useCallback(async () => {
     setLoading(true);
@@ -2703,6 +3120,32 @@ export default function App() {
             onApplyFilters={onLoadData}
             onResetFilters={onResetFilters}
             users={users} />
+        </ErrorBoundary>
+      );
+      case "Security Dashboard": return (
+        <ErrorBoundary fallbackTitle="Security Dashboard Temporarily Unavailable" fallbackMessage="The security dashboard section encountered an error.">
+          {securityDashboardAuthorized === null ? (
+            <LoadingState message="Verifying authorization…" />
+          ) : securityDashboardAuthorized === false ? (
+            <div className="notice error">
+              <h2>Access Denied</h2>
+              <p>{securityDashboardAuthError || "You are not authorized to view the Security Dashboard."}</p>
+              <p style={{ fontSize: "12px", color: "#6B7280", marginTop: 8 }}>
+                The Security Dashboard requires ADMIN role and valid MyGeotab session verification.
+              </p>
+            </div>
+          ) : (
+            <SecurityDashboard
+              findings={reconciliationFindings}
+              runState={reconciliationRunState}
+              loading={reconciliationLoading}
+              onRefresh={loadReconciliationFindings}
+              addInId={addInId}
+              geotabApi={geotabApi}
+              addToast={pushToastCb}
+              mode={mode}
+            />
+          )}
         </ErrorBoundary>
       );
       default: return (

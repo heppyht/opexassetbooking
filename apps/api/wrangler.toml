@@ -30,9 +30,6 @@ GEOTAB_DATABASE = "opex_trial"
 # GEOTAB_SERVICE_PASSWORD
 # GEOTAB_SERVICE_SERVER
 
-# JWT secret for signing authorization tokens
-# AUTHZ_JWT_SECRET
-
 [[migrations]]
 tag = "v1"
 preview_script = "preview-opex-vbm-api"

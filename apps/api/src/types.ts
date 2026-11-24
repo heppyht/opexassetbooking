@@ -6,7 +6,8 @@ export type BookingAction =
   | "assign_driver"
   | "complete_booking"
   | "cancel_booking"
-  | "create_booking";
+  | "create_booking"
+  | "view_security_dashboard";
 
 export type UserRole = "EMPLOYEE" | "APPROVER" | "GA" | "MANAGEMENT" | "ADMIN";
 
@@ -71,7 +72,4 @@ export interface Env {
   GEOTAB_SERVICE_USERNAME?: string;
   GEOTAB_SERVICE_PASSWORD?: string;
   GEOTAB_SERVICE_SERVER?: string;
-
-  /* JWT secret for signing authorization tokens — set via `wrangler secret put` */
-  AUTHZ_JWT_SECRET?: string;
 }

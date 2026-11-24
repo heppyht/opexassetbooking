@@ -449,3 +449,419 @@ function expectedAuditActionsForStatus(status: string): string[] {
       return [];
   }
 }
+
+/*───────────────────── Enhanced Audit Reconciliation Engine ─────────────────────*/
+/* Comprehensive reconciliation that scans booking records against audit
+   records to detect security-relevant anomalies. Original audit evidence
+   is never overwritten; findings are stored as separate reconciliation
+   finding records for administrator review. */
+
+import type { OpexReconciliationFinding, ReconciliationFindingType, ReconciliationSeverity, ReconciliationStatus } from "../data/types";
+
+/* Generate a deterministic finding ID from booking ID, finding type, and
+   detection timestamp. Not cryptographically secure — used for dedup. */
+function generateFindingId(bookingId: string, findingType: ReconciliationFindingType, timestamp: string): string {
+  const raw = `${bookingId}:${findingType}:${timestamp}`;
+  let hash = 0;
+  for (let i = 0; i < raw.length; i++) {
+    const char = raw.charCodeAt(i);
+    hash = (hash << 5) - hash + char;
+    hash = hash & hash;
+  }
+  return `find-${Math.abs(hash).toString(16)}-${bookingId.slice(-8)}`;
+}
+
+/* Classify evidence into one of four categories. Does not assume malicious
+   intent — missing audit records may result from interrupted operations. */
+export function classifyEvidence(
+  findingType: ReconciliationFindingType,
+  hasValidActor: boolean,
+  hasValidTransition: boolean,
+  hasPriorAuditTrail: boolean,
+): "LEGITIMATE_PARTIAL_WRITE" | "INTERRUPTED_OPERATION" | "POTENTIAL_UNAUTHORIZED_WRITE" | "INSUFFICIENT_EVIDENCE" {
+  /* If we cannot determine the cause, default to insufficient evidence. */
+  if (!hasValidActor && !hasValidTransition && !hasPriorAuditTrail) {
+    return "INSUFFICIENT_EVIDENCE";
+  }
+  /* Legitimate partial write: booking created but audit write interrupted */
+  if (findingType === "MISSING_AUDIT_EVENT" && hasValidActor && hasValidTransition && hasPriorAuditTrail) {
+    return "LEGITIMATE_PARTIAL_WRITE";
+  }
+  /* Interrupted operation: actor and transition are valid, no prior trail */
+  if (findingType === "MISSING_AUDIT_EVENT" && hasValidActor && hasValidTransition && !hasPriorAuditTrail) {
+    return "INTERRUPTED_OPERATION";
+  }
+  /* Potential unauthorized write: invalid actor or invalid transition */
+  if (!hasValidActor || !hasValidTransition) {
+    return "POTENTIAL_UNAUTHORIZED_WRITE";
+  }
+  return "INSUFFICIENT_EVIDENCE";
+}
+
+/* Determine severity for a finding type. */
+export function findingSeverity(findingType: ReconciliationFindingType): ReconciliationSeverity {
+  switch (findingType) {
+    case "INVALID_ACTOR_ATTRIBUTION":
+    case "RECORD_MODIFIED_WITHOUT_AUDIT":
+    case "DUPLICATE_BOOKING_RECORD":
+      return "HIGH";
+    case "UNEXPECTED_STATUS_TRANSITION":
+    case "RECORD_DELETED_WITHOUT_AUDIT":
+    case "NOTIFICATION_MANIPULATION":
+      return "HIGH";
+    case "MISSING_AUDIT_EVENT":
+      return "MEDIUM";
+    case "VERSION_MISMATCH":
+    case "INCONSISTENT_BOOKING_STATE":
+      return "MEDIUM";
+    case "INSUFFICIENT_EVIDENCE":
+      return "LOW";
+    default:
+      return "MEDIUM";
+  }
+}
+
+/* Expected audit actions for a given booking status (shared with existing logic). */
+function expectedAuditActionsForStatusEnhanced(status: string): string[] {
+  switch (status) {
+    case "PENDING_APPROVAL":
+      return ["BOOKING_CREATED"];
+    case "APPROVED":
+      return ["BOOKING_CREATED", "BOOKING_APPROVED"];
+    case "REJECTED":
+      return ["BOOKING_CREATED", "BOOKING_REJECTED"];
+    case "ASSIGNED":
+      return ["BOOKING_CREATED", "BOOKING_APPROVED", "VEHICLE_ASSIGNED"];
+    case "IN_PROGRESS":
+      return ["BOOKING_CREATED", "BOOKING_APPROVED", "VEHICLE_ASSIGNED", "DRIVER_ASSIGNED"];
+    case "COMPLETED":
+      return ["BOOKING_CREATED", "BOOKING_APPROVED", "VEHICLE_ASSIGNED", "DRIVER_ASSIGNED", "BOOKING_COMPLETED"];
+    case "CANCELLED":
+      return ["BOOKING_CREATED", "BOOKING_CANCELLED"];
+    case "DRAFT":
+    case "SUBMITTED":
+      return ["BOOKING_CREATED"];
+    default:
+      return [];
+  }
+}
+
+/* Valid booking state transitions (mirrors authz.ts validateTransition). */
+const VALID_TRANSITIONS: Record<string, string[]> = {
+  DRAFT: ["SUBMITTED"],
+  SUBMITTED: ["PENDING_APPROVAL"],
+  PENDING_APPROVAL: ["APPROVED", "REJECTED", "CANCELLED"],
+  APPROVED: ["ASSIGNED", "CANCELLED"],
+  ASSIGNED: ["IN_PROGRESS", "COMPLETED", "CANCELLED"],
+  IN_PROGRESS: ["COMPLETED", "CANCELLED"],
+  COMPLETED: [],
+  REJECTED: [],
+  CANCELLED: [],
+};
+
+/* Enhanced reconciliation result with full finding details. */
+export interface EnhancedReconciliationFinding {
+  finding_id: string;
+  booking_id: string;
+  finding_type: ReconciliationFindingType;
+  severity: ReconciliationSeverity;
+  expected_state: string | null;
+  observed_state: string | null;
+  detection_timestamp: string;
+  related_audit_references: string[];
+  reconciliation_status: ReconciliationStatus;
+  evidence_classification: "LEGITIMATE_PARTIAL_WRITE" | "INTERRUPTED_OPERATION" | "POTENTIAL_UNAUTHORIZED_WRITE" | "INSUFFICIENT_EVIDENCE";
+  notes: string | null;
+}
+
+/* Comprehensive reconciliation of bookings against audit records, notifications,
+   and version history. Returns structured findings for each anomaly detected. */
+export function reconcileAuditEnhanced(
+  bookings: ResolvedBooking[],
+  audits: OpexBookingAudit[],
+  notifications: { id: string; booking_id: string; actor_user_id: string; created_at: string; type: string }[],
+): EnhancedReconciliationFinding[] {
+  const findings: EnhancedReconciliationFinding[] = [];
+  const now = new Date().toISOString();
+
+  /* Build audit lookup by booking ID */
+  const auditByBooking = new Map<string, OpexBookingAudit[]>();
+  for (const audit of audits) {
+    const existing = auditByBooking.get(audit.booking_id) ?? [];
+    existing.push(audit);
+    auditByBooking.set(audit.booking_id, existing);
+  }
+
+  /* Build notification lookup by booking ID */
+  const notificationByBooking = new Map<string, typeof notifications[number][]>();
+  for (const n of notifications) {
+    const existing = notificationByBooking.get(n.booking_id) ?? [];
+    existing.push(n);
+    notificationByBooking.set(n.booking_id, existing);
+  }
+
+  /* Track booking IDs seen to detect duplicates */
+  const bookingIdCounts = new Map<string, number>();
+  for (const b of bookings) {
+    bookingIdCounts.set(b.id, (bookingIdCounts.get(b.id) ?? 0) + 1);
+  }
+
+  for (const booking of bookings) {
+    const auditsForBooking = auditByBooking.get(booking.id) ?? [];
+    const notificationsForBooking = notificationByBooking.get(booking.id) ?? [];
+
+    /* Sort audits by timestamp descending */
+    const sortedAudits = [...auditsForBooking].sort(
+      (a, b) => new Date(b.created_at).getTime() - new Date(a.created_at).getTime(),
+    );
+    const lastAudit = sortedAudits.length > 0 ? sortedAudits[0] : null;
+
+    /* 1. Missing audit events */
+    const expectedActions = expectedAuditActionsForStatusEnhanced(booking.status);
+    const missingActions = expectedActions.filter(
+      expected => !auditsForBooking.some(a => a.action === expected),
+    );
+    if (missingActions.length > 0) {
+      const hasValidActor = lastAudit ? lastAudit.actor_user_id === booking.requester_id : false;
+      const classification = classifyEvidence(
+        "MISSING_AUDIT_EVENT",
+        hasValidActor,
+        true,
+        auditsForBooking.length > 0,
+      );
+      findings.push({
+        finding_id: generateFindingId(booking.id, "MISSING_AUDIT_EVENT", now),
+        booking_id: booking.id,
+        finding_type: "MISSING_AUDIT_EVENT",
+        severity: findingSeverity("MISSING_AUDIT_EVENT"),
+        expected_state: `Expected audit actions: ${expectedActions.join(", ")}`,
+        observed_state: `Present audit actions: ${auditsForBooking.map(a => a.action).join(", ") || "none"}`,
+        detection_timestamp: now,
+        related_audit_references: auditsForBooking.map(a => a.id),
+        reconciliation_status: "OPEN",
+        evidence_classification: classification,
+        notes: `Booking ${booking.id} in status ${booking.status} is missing audit events: ${missingActions.join(", ")}`,
+      });
+    }
+
+    /* 2. Unexpected status transitions (audit shows a transition not in valid list) */
+    for (let i = 1; i < sortedAudits.length; i++) {
+      const prev = sortedAudits[i - 1];
+      const curr = sortedAudits[i];
+      const prevStatus = prev.new_status ?? prev.previous_status;
+      const currStatus = curr.new_status ?? curr.previous_status;
+      if (prevStatus && currStatus) {
+        const allowed = VALID_TRANSITIONS[prevStatus];
+        if (allowed && !allowed.includes(currStatus)) {
+          findings.push({
+            finding_id: generateFindingId(booking.id, "UNEXPECTED_STATUS_TRANSITION", `${now}:${i}`),
+            booking_id: booking.id,
+            finding_type: "UNEXPECTED_STATUS_TRANSITION",
+            severity: findingSeverity("UNEXPECTED_STATUS_TRANSITION"),
+            expected_state: `Valid transitions from ${prevStatus}: ${allowed.join(", ")}`,
+            observed_state: `Transition ${prevStatus} -> ${currStatus} at ${curr.created_at}`,
+            detection_timestamp: now,
+            related_audit_references: [prev.id, curr.id],
+            reconciliation_status: "OPEN",
+            evidence_classification: classifyEvidence(
+              "UNEXPECTED_STATUS_TRANSITION",
+              curr.actor_user_id === booking.requester_id,
+              false,
+              true,
+            ),
+            notes: `Audit record ${curr.id} shows unexpected transition ${prevStatus} -> ${currStatus}`,
+          });
+        }
+      }
+    }
+
+    /* 3. Invalid actor attribution (audit actor doesn't match booking requester) */
+    for (const audit of sortedAudits) {
+      if (audit.actor_user_id && audit.actor_user_id !== booking.requester_id) {
+        /* Allow approver to act on behalf of requester for approval actions */
+        const isApprovalAction = audit.action === "BOOKING_APPROVED" || audit.action === "BOOKING_REJECTED";
+        const isDriverAssignment = audit.action === "VEHICLE_ASSIGNED" || audit.action === "DRIVER_ASSIGNED";
+        if (!isApprovalAction && !isDriverAssignment) {
+          findings.push({
+            finding_id: generateFindingId(booking.id, "INVALID_ACTOR_ATTRIBUTION", `${now}:${audit.id}`),
+            booking_id: booking.id,
+            finding_type: "INVALID_ACTOR_ATTRIBUTION",
+            severity: findingSeverity("INVALID_ACTOR_ATTRIBUTION"),
+            expected_state: `Actor should be ${booking.requester_id} (booking requester)`,
+            observed_state: `Actor recorded as ${audit.actor_user_id} in audit ${audit.id}`,
+            detection_timestamp: now,
+            related_audit_references: [audit.id],
+            reconciliation_status: "OPEN",
+            evidence_classification: classifyEvidence(
+              "INVALID_ACTOR_ATTRIBUTION",
+              false,
+              true,
+              true,
+            ),
+            notes: `Audit record ${audit.id} has actor ${audit.actor_user_id} that does not match booking requester ${booking.requester_id}`,
+          });
+        }
+      }
+    }
+
+    /* 4. Version mismatch (booking version inconsistent with audit count) */
+    const auditCountForBooking = auditsForBooking.length;
+    if (booking.version > 0 && auditCountForBooking > 0 && booking.version !== auditCountForBooking + 1) {
+      /* version starts at 1, each audit represents a state change; initial creation has 1 audit */
+      findings.push({
+        finding_id: generateFindingId(booking.id, "VERSION_MISMATCH", now),
+        booking_id: booking.id,
+        finding_type: "VERSION_MISMATCH",
+        severity: findingSeverity("VERSION_MISMATCH"),
+        expected_state: `Booking version ${booking.version} should align with ${auditCountForBooking + 1} audit records`,
+        observed_state: `Booking version ${booking.version} with ${auditCountForBooking} audit records`,
+        detection_timestamp: now,
+        related_audit_references: auditsForBooking.map(a => a.id),
+        reconciliation_status: "OPEN",
+        evidence_classification: classifyEvidence(
+          "VERSION_MISMATCH",
+          true,
+          true,
+          true,
+        ),
+        notes: `Booking ${booking.id} version ${booking.version} inconsistent with ${auditCountForBooking} audit records`,
+      });
+    }
+
+    /* 5. Duplicate booking records */
+    const count = bookingIdCounts.get(booking.id) ?? 0;
+    if (count > 1) {
+      findings.push({
+        finding_id: generateFindingId(booking.id, "DUPLICATE_BOOKING_RECORD", now),
+        booking_id: booking.id,
+        finding_type: "DUPLICATE_BOOKING_RECORD",
+        severity: findingSeverity("DUPLICATE_BOOKING_RECORD"),
+        expected_state: `Single booking record for ID ${booking.id}`,
+        observed_state: `${bookingIdCounts.get(booking.id)} booking records with ID ${booking.id}`,
+        detection_timestamp: now,
+        related_audit_references: auditsForBooking.map(a => a.id),
+        reconciliation_status: "OPEN",
+        evidence_classification: classifyEvidence(
+          "DUPLICATE_BOOKING_RECORD",
+          true,
+          true,
+          true,
+        ),
+        notes: `Duplicate booking records detected for ID ${booking.id}`,
+      });
+    }
+
+    /* 6. Inconsistent booking state (status without expected audit trail) */
+    if (booking.status === "APPROVED" && !auditsForBooking.some(a => a.action === "BOOKING_APPROVED")) {
+      findings.push({
+        finding_id: generateFindingId(booking.id, "INCONSISTENT_BOOKING_STATE", now),
+        booking_id: booking.id,
+        finding_type: "INCONSISTENT_BOOKING_STATE",
+        severity: findingSeverity("INCONSISTENT_BOOKING_STATE"),
+        expected_state: "APPROVED status requires BOOKING_APPROVED audit event",
+        observed_state: "APPROVED status with no BOOKING_APPROVED audit event",
+        detection_timestamp: now,
+        related_audit_references: auditsForBooking.map(a => a.id),
+        reconciliation_status: "OPEN",
+        evidence_classification: classifyEvidence(
+          "INCONSISTENT_BOOKING_STATE",
+          true,
+          true,
+          auditsForBooking.length > 0,
+        ),
+        notes: `Booking ${booking.id} is APPROVED but lacks BOOKING_APPROVED audit event`,
+      });
+    }
+  }
+
+  /* 7. Detect bookings with audit records but no corresponding booking (orphaned audits) */
+  const bookingIds = new Set(bookings.map(b => b.id));
+  for (const audit of audits) {
+    if (!bookingIds.has(audit.booking_id)) {
+      findings.push({
+        finding_id: generateFindingId(audit.booking_id, "RECORD_DELETED_WITHOUT_AUDIT", `${now}:${audit.id}`),
+        booking_id: audit.booking_id,
+        finding_type: "RECORD_DELETED_WITHOUT_AUDIT",
+        severity: findingSeverity("RECORD_DELETED_WITHOUT_AUDIT"),
+        expected_state: "Booking record should exist for audit record",
+        observed_state: `Audit record ${audit.id} exists for booking ${audit.booking_id} but no booking record found`,
+        detection_timestamp: now,
+        related_audit_references: [audit.id],
+        reconciliation_status: "OPEN",
+        evidence_classification: classifyEvidence(
+          "RECORD_DELETED_WITHOUT_AUDIT",
+          false,
+          false,
+          true,
+        ),
+        notes: `Orphaned audit record ${audit.id} references deleted or missing booking ${audit.booking_id}`,
+      });
+    }
+  }
+
+  /* 8. Detect notification manipulation (notifications without booking context) */
+  for (const n of notifications) {
+    if (!bookingIds.has(n.booking_id)) {
+      findings.push({
+        finding_id: generateFindingId(n.booking_id, "NOTIFICATION_MANIPULATION", `${now}:${n.id}`),
+        booking_id: n.booking_id,
+        finding_type: "NOTIFICATION_MANIPULATION",
+        severity: findingSeverity("NOTIFICATION_MANIPULATION"),
+        expected_state: "Notification should reference an existing booking",
+        observed_state: `Notification ${n.id} references non-existent booking ${n.booking_id}`,
+        detection_timestamp: now,
+        related_audit_references: [],
+        reconciliation_status: "OPEN",
+        evidence_classification: classifyEvidence(
+          "NOTIFICATION_MANIPULATION",
+          false,
+          false,
+          false,
+        ),
+        notes: `Notification ${n.id} references booking ${n.booking_id} that does not exist`,
+      });
+    }
+  }
+
+  return findings;
+}
+
+/* Store a reconciliation finding as an AddInData record. Does not modify
+   original audit evidence — findings are separate records. */
+export async function storeReconciliationFinding(
+  provider: { createAuditRecord?: unknown } & Record<string, unknown>,
+  finding: OpexReconciliationFinding,
+): Promise<void> {
+  /* Best-effort store; reconciliation findings are advisory only. */
+  try {
+    const createFn = (provider as { createReconciliationFinding?: (f: OpexReconciliationFinding) => Promise<void> }).createReconciliationFinding;
+    if (typeof createFn === "function") {
+      await createFn(finding);
+    }
+  } catch {
+    /* Findings are advisory — failure to store is not critical */
+  }
+}
+
+/* Convert an EnhancedReconciliationFinding to an OpexReconciliationFinding
+   for storage in AddInData. */
+export function toOpexReconciliationFinding(
+  finding: EnhancedReconciliationFinding,
+): OpexReconciliationFinding {
+  return {
+    recordType: "reconciliation_finding",
+    schemaVersion: 1,
+    id: finding.finding_id,
+    finding_id: finding.finding_id,
+    booking_id: finding.booking_id,
+    finding_type: finding.finding_type,
+    severity: finding.severity,
+    expected_state: finding.expected_state,
+    observed_state: finding.observed_state,
+    detection_timestamp: finding.detection_timestamp,
+    related_audit_references: finding.related_audit_references,
+    reconciliation_status: finding.reconciliation_status,
+    evidence_classification: finding.evidence_classification,
+    notes: finding.notes,
+  };
+}

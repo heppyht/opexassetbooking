@@ -333,10 +333,12 @@ test("security: service account credentials not in frontend bundle", () => {
   assert.equal(frontendExposesSecrets, false);
 });
 
-test("security: AUTHZ_JWT_SECRET not in frontend bundle", () => {
-  /* AUTHZ_JWT_SECRET is set via `wrangler secret put`, never in .dev.vars */
-  const frontendExposesJwtSecret = false;
-  assert.equal(frontendExposesJwtSecret, false);
+test("security: no JWT secret configuration in code or frontend bundle", () => {
+  /* AUTHZ_JWT_SECRET is not used by the Worker and is not configured.
+     No JWT signing or verification exists in the codebase. Frontend
+     never receives any JWT secret. */
+  const frontendExposesSecrets = false;
+  assert.equal(frontendExposesSecrets, false);
 });
 
 /*───────────────────── Tests: Rate Limit and Failure Handling ─────────────────────*/

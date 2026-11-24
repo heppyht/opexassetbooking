@@ -76,7 +76,6 @@ MyGeotab AddInData is a client-side storage API with no server-side authorizatio
 
 - Service account must be configured in MyGeotab `opex_trial` with ManageAddInData clearance
 - Service account credentials set via `wrangler secret put` (never in `.dev.vars` or code)
-- `AUTHZ_JWT_SECRET` set via `wrangler secret put` for token signing
 - `VITE_AUTHZ_API_BASE_URL` set in frontend environment
 - All AddInData writes go through the service account; the client never writes protected operations directly
 
@@ -85,7 +84,7 @@ MyGeotab AddInData is a client-side storage API with no server-side authorizatio
 1. **Service Add-In validation:** A background Service Add-In could reconcile AddInData records and flag/remove unauthorized ones (direct client writes).
 2. **Custom security identifiers:** Define `"securityIds": [{"name": "Manage OPEX Bookings", ...}]` in Add-In configuration for granular view control (does not affect AddInData API permissions).
 3. **Session verification caching:** Cache verified sessions to reduce MyGeotab API calls (respect rate limits).
-4. **Add-In URL hyphen restriction:** The GitHub Pages URL contains hyphens and may be rejected by MyGeotab Add-In loading (documented in DEPLOYMENT.md section 10).
+4. **Add-In URL character restriction:** The GitHub Pages URLs (`https://heppyh.github.io/opexassetbooking/` and `.../serviceAddin.js`) were verified character by character and contain no hyphen (`-`), at sign (`@`), or hash (`#`). They satisfy Geotab's requirement for externally hosted Add-In URLs (see DEPLOYMENT.md section 2).
 
 ## Related Documents
 

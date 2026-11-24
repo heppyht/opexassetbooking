@@ -18,9 +18,10 @@
 **Mitigation:**
 - Trusted authorization Worker (Phase 6) enforces server-side RBAC for UI-initiated operations
 - Custom security identifiers can gate Add-In menu visibility (not API access)
-- Service Add-In reconciliation (recommended future work) can detect unauthorized records
+- Service Add-In reconciliation (Phase 18.3) periodically scans AddInData and detects unauthorized records
+- Security Monitoring Dashboard (Phase 18.6) displays reconciliation findings for administrator review
 
-**Residual risk:** High — employees can create fake bookings, modify status to APPROVED, or delete bookings directly.
+**Residual risk:** High — employees can create fake bookings, modify status to APPROVED, or delete bookings directly. Detection via reconciliation reduces but does not eliminate this risk.
 
 ### T2: Direct AddInData Read (Get)
 
@@ -42,9 +43,9 @@
 
 **Can MyGeotab prevent?** ❌ No.
 
-**Mitigation:** Server records verified actor ID at write time (Phase 6). Direct client writes to audit records are not covered by server audit trail.
+**Mitigation:** Server records verified actor ID at write time (Phase 6). Direct client writes to audit records are not covered by server audit trail. Reconciliation engine (Phase 18.2) detects records modified or deleted without audit trail.
 
-**Residual risk:** High — audit integrity cannot be guaranteed against direct client writes.
+**Residual risk:** High — audit integrity cannot be guaranteed against direct client writes. Reconciliation detects tampering after the fact.
 
 ### T4: Unauthorized Status Change
 
@@ -54,9 +55,9 @@
 
 **Can MyGeotab prevent?** ❌ No.
 
-**Mitigation:** Trusted authorization Worker validates transitions and actor identity before any server-mediated write. Direct client writes bypass this.
+**Mitigation:** Trusted authorization Worker validates transitions and actor identity before any server-mediated write. Direct client writes bypass this. Reconciliation engine (Phase 18.2) detects unexpected status transitions and inconsistent booking states.
 
-**Residual risk:** Critical — approval workflow can be bypassed entirely.
+**Residual risk:** Critical — approval workflow can be bypassed entirely. Reconciliation detects the anomaly post-hoc.
 
 ### T5: Session ID Theft
 
@@ -86,6 +87,26 @@
 
 **Residual risk:** Low — server validates every request.
 
+### T8: Missing Audit Events (Reconciliation Finding)
+
+**Description:** A booking record exists without corresponding audit events, indicating either interrupted operations or direct client writes that bypassed the audit trail.
+
+**Detection:** Reconciliation engine (Phase 18.2) compares booking records against expected audit actions for each status.
+
+**Mitigation:** Findings stored as `reconciliation_finding` records in AddInData, displayed in Security Monitoring Dashboard (Phase 18.6). Evidence classified as LEGITIMATE_PARTIAL_WRITE, INTERRUPTED_OPERATION, POTENTIAL_UNAUTHORIZED_WRITE, or INSUFFICIENT_EVIDENCE.
+
+**Residual risk:** Medium — detection capability implemented; remediation requires administrator review.
+
+### T9: Booking State Inconsistency (Reconciliation Finding)
+
+**Description:** A booking's status is inconsistent with its audit trail (e.g., APPROVED status without BOOKING_APPROVED audit event), version mismatch, duplicate records, or orphaned audit records.
+
+**Detection:** Reconciliation engine (Phase 18.2) validates booking state against audit records, notification context, and version history.
+
+**Mitigation:** Findings stored as `reconciliation_finding` records in AddInData. Booking state validation (Phase 18.5) in authz.ts provides server-side transition and state validation for UI-initiated operations.
+
+**Residual risk:** Medium — detection capability implemented; server-side validation prevents new inconsistencies through the trusted Worker.
+
 ---
 
 ## Attack Path Summary
@@ -98,6 +119,8 @@
 | Direct AddInData.Get | ❌ | ❌ | Medium |
 | Audit tampering | ❌ | ❌ | High |
 | Unauthorized status change | ❌ | ❌ | Critical |
+| Missing audit events | ❌ | ⚠️ Detected by reconciliation | Medium |
+| Booking state inconsistency | ❌ | ⚠️ Detected by reconciliation | Medium |
 | Session ID theft | N/A | ⚠️ HTTPS only | Low |
 | Service account compromise | N/A | Secrets only | Low |
 | Expired session rejection | N/A | Server validates | Low |
@@ -114,7 +137,13 @@
 | Server-mediated AddInData writes | 6 | ✅ Implemented |
 | Session ID capture and verification | 6 | ✅ Implemented |
 | Custom security identifiers (view gate) | 7 | ⚠️ Documented, not tested |
-| Service Add-In reconciliation | Future | ❌ Not implemented |
+| Enhanced booking state validation | 18.5 | ✅ Implemented |
+| Audit reconciliation engine | 18.2 | ✅ Implemented |
+| Service Add-In reconciliation polling | 18.3 | ✅ Implemented |
+| Reconciliation finding storage (AddInData) | 18.4 | ✅ Implemented |
+| Audit integrity monitoring | 18.4 | ✅ Implemented |
+| Security Monitoring Dashboard | 18.6 | ✅ Implemented |
+| Automated reconciliation tests | 18.7 | ✅ Implemented |
 
 ## Tenant Validation Required
 
@@ -126,7 +155,9 @@
 | Session ID from getSession() | Documented only | ✅ Yes |
 | Rate limit enforcement | Documented only | ⚠️ Recommended |
 | Add-In URL hyphen restriction | Documented | ✅ Yes (deployment blocker) |
+| Reconciliation finding accuracy | Mock-tested | ✅ Yes (unit tests) |
+| Security Dashboard rendering | Not tenant-tested | ✅ Yes (UI component) |
 
 ---
 
-**Bottom line:** MyGeotab AddInData does not provide record-level or operation-level authorization that can prevent ordinary employees from directly writing to AddInData. The trusted authorization Worker is a strong deterrent for UI-initiated operations but cannot prevent direct API calls from the browser console. Production deployment requires accepting this risk or implementing additional controls (Service Add-In reconciliation).
+**Bottom line:** MyGeotab AddInData does not provide record-level or operation-level authorization that can prevent ordinary employees from directly writing to AddInData. The trusted authorization Worker is a strong deterrent for UI-initiated operations but cannot prevent direct API calls from the browser console. Phase 18 adds detection capability via the audit reconciliation engine and Service Add-In polling, which identifies anomalies post-hoc for administrator review. Production deployment requires accepting this residual risk — reconciliation detects but does not prevent direct writes.

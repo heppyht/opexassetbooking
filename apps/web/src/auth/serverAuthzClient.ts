@@ -20,7 +20,7 @@ export type ExecuteResult =
   | { success: true; recordId: string; actorUserId: string }
   | { success: false; error: string; reason: string };
 
-class ServerAuthzError extends Error {
+export class ServerAuthzError extends Error {
   constructor(public status: number, message: string) {
     super(message);
     this.name = "ServerAuthzError";

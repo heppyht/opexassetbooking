@@ -46,6 +46,7 @@ const ACTION_REQUIRED_ROLE: Record<BookingAction, UserRole> = {
   complete_booking: "EMPLOYEE",
   cancel_booking: "EMPLOYEE",
   create_booking: "EMPLOYEE",
+  view_security_dashboard: "ADMIN",
 };
 
 export function roleHasMinRank(role: UserRole, minRole: UserRole): boolean {
@@ -345,6 +346,7 @@ export function validateTransition(
     PENDING_APPROVAL: ["APPROVED", "REJECTED", "CANCELLED"],
     APPROVED: ["ASSIGNED", "CANCELLED"],
     ASSIGNED: ["COMPLETED", "CANCELLED"],
+    IN_PROGRESS: ["COMPLETED", "CANCELLED"],
     COMPLETED: [],
     REJECTED: [],
     CANCELLED: [],
@@ -358,6 +360,125 @@ export function validateTransition(
     return `Invalid transition from ${currentStatus} to ${newStatus}`;
   }
   return null;
+}
+
+/* Result of a detailed booking state validation. */
+export interface BookingStateValidationResult {
+  valid: boolean;
+  errors: string[];
+  warnings: string[];
+}
+
+/* Valid booking statuses. */
+const VALID_BOOKING_STATUSES = new Set([
+  "DRAFT",
+  "SUBMITTED",
+  "PENDING_APPROVAL",
+  "APPROVED",
+  "ASSIGNED",
+  "IN_PROGRESS",
+  "COMPLETED",
+  "REJECTED",
+  "CANCELLED",
+]);
+
+/* Required audit actions for each booking status. */
+const REQUIRED_AUDIT_ACTIONS: Record<string, string[]> = {
+  DRAFT: ["BOOKING_CREATED"],
+  SUBMITTED: ["BOOKING_CREATED"],
+  PENDING_APPROVAL: ["BOOKING_CREATED"],
+  APPROVED: ["BOOKING_CREATED", "BOOKING_APPROVED"],
+  REJECTED: ["BOOKING_CREATED", "BOOKING_REJECTED"],
+  ASSIGNED: ["BOOKING_CREATED", "BOOKING_APPROVED", "VEHICLE_ASSIGNED"],
+  IN_PROGRESS: ["BOOKING_CREATED", "BOOKING_APPROVED", "VEHICLE_ASSIGNED", "DRIVER_ASSIGNED"],
+  COMPLETED: ["BOOKING_CREATED", "BOOKING_APPROVED", "VEHICLE_ASSIGNED", "DRIVER_ASSIGNED", "BOOKING_COMPLETED"],
+  CANCELLED: ["BOOKING_CREATED", "BOOKING_CANCELLED"],
+};
+
+/* Comprehensive booking state validation. Checks status validity, transition
+   validity, and consistency between booking status and audit trail. Does not
+   modify any records — purely advisory. */
+export function validateBookingState(
+  booking: { id: string; status: string; version?: number },
+  auditActions: string[],
+): BookingStateValidationResult {
+  const errors: string[] = [];
+  const warnings: string[] = [];
+
+  /* 1. Status must be a known value */
+  if (!VALID_BOOKING_STATUSES.has(booking.status)) {
+    errors.push(`Unknown booking status: ${booking.status}`);
+    return { valid: false, errors, warnings };
+  }
+
+  /* 2. Version must be a positive integer if present */
+  if (booking.version !== undefined && (booking.version < 1 || !Number.isInteger(booking.version))) {
+    errors.push(`Invalid booking version: ${booking.version}`);
+  }
+
+  /* 3. Check that required audit actions are present for the current status */
+  const required = REQUIRED_AUDIT_ACTIONS[booking.status];
+  if (required) {
+    for (const action of required) {
+      if (!auditActions.includes(action)) {
+        errors.push(`Missing required audit action "${action}" for status "${booking.status}"`);
+      }
+    }
+  }
+
+  /* 4. Warning if version is low relative to audit count */
+  if (booking.version !== undefined && auditActions.length > 0 && booking.version < auditActions.length) {
+    warnings.push(`Booking version ${booking.version} is lower than audit record count ${auditActions.length}`);
+  }
+
+  return {
+    valid: errors.length === 0,
+    errors,
+    warnings,
+  };
+}
+
+/* Detailed transition validation result. */
+export interface TransitionValidationResult {
+  allowed: boolean;
+  currentStatus: string;
+  newStatus: string;
+  error: string | null;
+}
+
+/* Validate a booking transition with detailed result. */
+export function validateBookingTransition(
+  currentStatus: string,
+  newStatus: string,
+): TransitionValidationResult {
+  const error = validateTransition(currentStatus, newStatus);
+  return {
+    allowed: error === null,
+    currentStatus,
+    newStatus,
+    error,
+  };
+}
+
+/* Check if a status string is a valid booking status. */
+export function isValidBookingStatus(status: string): boolean {
+  return VALID_BOOKING_STATUSES.has(status);
+}
+
+/* Get all valid transitions from a given status. */
+export function getValidTransitions(currentStatus: string): string[] {
+  const validTransitions: Record<string, string[]> = {
+    DRAFT: ["SUBMITTED"],
+    SUBMITTED: ["PENDING_APPROVAL"],
+    PENDING_APPROVAL: ["APPROVED", "REJECTED", "CANCELLED"],
+    APPROVED: ["ASSIGNED", "CANCELLED"],
+    ASSIGNED: ["COMPLETED", "CANCELLED"],
+    IN_PROGRESS: ["COMPLETED", "CANCELLED"],
+    COMPLETED: [],
+    REJECTED: [],
+    CANCELLED: [],
+  };
+  return validTransitions[currentStatus] ?? [];
 }
 
 /*───────────────────── Audit Record Helper ─────────────────────*/

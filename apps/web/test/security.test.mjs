@@ -9,6 +9,7 @@ import assert from "node:assert/strict";
 import {
   authorizeAction,
   canPerformAction,
+  getRequiredRole,
   isAuthorizedActor,
 } from "../src/auth/authorization.ts";
 import { emitAuditEvent, resetAuditDedupForTests, resetAuditQueueForTests, reconcileAudit } from "../src/audit/auditTrail.ts";
@@ -193,6 +194,36 @@ test("security: canPerformAction returns true for APPROVER approving", () => {
 
 test("security: canPerformAction returns false for EMPLOYEE approving", () => {
   assert.equal(canPerformAction("approve_booking", authenticatedIdentity(["EMPLOYEE"])), false);
+});
+
+/*───────────────────── Security Dashboard Authorization Tests ─────────────────────*/
+
+test("security: canPerformAction view_security_dashboard allows ADMIN", () => {
+  assert.equal(canPerformAction("view_security_dashboard", authenticatedIdentity(["ADMIN"])), true);
+});
+
+test("security: canPerformAction view_security_dashboard denies MANAGEMENT", () => {
+  assert.equal(canPerformAction("view_security_dashboard", authenticatedIdentity(["MANAGEMENT"])), false);
+});
+
+test("security: canPerformAction view_security_dashboard denies APPROVER", () => {
+  assert.equal(canPerformAction("view_security_dashboard", authenticatedIdentity(["APPROVER"])), false);
+});
+
+test("security: canPerformAction view_security_dashboard denies EMPLOYEE", () => {
+  assert.equal(canPerformAction("view_security_dashboard", authenticatedIdentity(["EMPLOYEE"])), false);
+});
+
+test("security: canPerformAction view_security_dashboard denies null identity", () => {
+  assert.equal(canPerformAction("view_security_dashboard", null), false);
+});
+
+test("security: canPerformAction view_security_dashboard denies unresolved identity", () => {
+  assert.equal(canPerformAction("view_security_dashboard", unresolvedIdentity()), false);
+});
+
+test("security: getRequiredRole view_security_dashboard returns ADMIN", () => {
+  assert.equal(getRequiredRole("view_security_dashboard"), "ADMIN");
 });
 
 /*───────────────────── isAuthorizedActor Tests ─────────────────────*/
