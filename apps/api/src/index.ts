@@ -62,13 +62,13 @@ app.get("/authz/health", c => c.json({
 app.post("/authz/verify", async c => {
   const body = await c.req.json().catch(() => null) as
     | null
-    | { sessionId?: string; database?: string; server?: string };
+    | { sessionId?: string; database?: string; server?: string; userName?: string };
 
-  if (!body?.sessionId || !body?.database || !body?.server) {
+  if (!body?.sessionId || !body?.database || !body?.server || !body?.userName) {
     return c.json({ ok: false, error: "MISSING_CREDENTIALS" }, 400);
   }
 
-  const result = await verifyIdentity(body.sessionId, body.database, body.server);
+  const result = await verifyIdentity(body.sessionId, body.database, body.server, body.userName);
 
   if (!result.ok) {
     return c.json({ ok: false, error: result.error }, 401);
@@ -87,7 +87,7 @@ app.post("/authz/authorize", async c => {
     | null
     | AuthorizationRequest;
 
-  if (!body?.sessionId || !body?.database || !body?.server || !body?.action) {
+  if (!body?.sessionId || !body?.database || !body?.server || !body?.userName || !body?.action) {
     return c.json({ authorized: false, error: "MISSING_REQUEST_FIELDS", reason: "BAD_REQUEST" }, 400);
   }
 
@@ -107,7 +107,7 @@ app.post("/authz/execute", async c => {
     | null
     | ExecutionRequest;
 
-  if (!body?.sessionId || !body?.database || !body?.server || !body?.action || !body?.bookingId) {
+  if (!body?.sessionId || !body?.database || !body?.server || !body?.userName || !body?.action || !body?.bookingId) {
     return c.json({ success: false, error: "MISSING_REQUEST_FIELDS", reason: "BAD_REQUEST" }, 400);
   }
 

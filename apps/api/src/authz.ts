@@ -22,6 +22,7 @@ import type {
 export type { AuthorizationRequest, ExecutionRequest };
 import {
   addInDataAdd,
+  addInDataGet,
   ServiceAccountSession,
   verifySession,
 } from "./integrations/mygeotab/client.ts";
@@ -64,13 +65,13 @@ export async function verifyIdentity(
   sessionId: string,
   database: string,
   server: string,
+  userName: string,
 ): Promise<{ ok: true; principal: VerifiedPrincipal } | { ok: false; error: string }> {
-  if (!sessionId || !database || !server) {
+  if (!sessionId || !database || !server || !userName) {
     return { ok: false, error: "MISSING_CREDENTIALS" };
   }
 
-  /* We need the userName to verify. The client sends it alongside sessionId. */
-  return verifySession(server, database, "", sessionId);
+  return verifySession(server, database, userName, sessionId);
 }
 
 /*───────────────────── Authorization Decision ─────────────────────*/
@@ -108,11 +109,14 @@ export async function handleAuthorize(
   _env: Env,
   req: AuthorizationRequest,
 ): Promise<AuthorizationResponse> {
-  /* 1. Authenticate: verify session ID with MyGeotab */
+  /* 1. Authenticate: verify session ID with MyGeotab.
+     The client sends userName from its MyGeotab session context. We never trust
+     it as proof of identity — MyGeotab validates the sessionId against the
+     userName and rejects mismatches. */
   const verification = await verifySession(
     req.server,
     req.database,
-    "", /* userName not needed for Get User by userName search */
+    req.userName,
     req.sessionId,
   );
 
@@ -162,7 +166,7 @@ export async function handleExecute(
   const verification = await verifySession(
     req.server,
     req.database,
-    "",
+    req.userName,
     req.sessionId,
   );
 
@@ -188,6 +192,12 @@ export async function handleExecute(
 
   /* 3. Get service account credentials for AddInData access */
   const serviceCreds = await serviceSession.getCredentials();
+
+  /* 3a. Check idempotency key — return cached result if already processed */
+  if (req.idempotencyKey) {
+    const cached = await checkIdempotencyKey(env, serviceCreds, addInId, req.idempotencyKey);
+    if (cached) return cached;
+  }
 
   /* 4. Build the booking record with verified actor attribution */
   const now = new Date().toISOString();
@@ -230,17 +240,29 @@ export async function handleExecute(
       details: auditDetails,
     });
 
-    return {
+    const executionResult: ExecutionResponse = {
       success: true,
       recordId: result.id,
       actorUserId: principal.userName,
     };
+
+    if (req.idempotencyKey) {
+      await storeIdempotencyKey(env, serviceCreds, addInId, req.idempotencyKey, executionResult);
+    }
+
+    return executionResult;
   } catch (e) {
-    return {
+    const errorResult: ExecutionResponse = {
       success: false,
       error: e instanceof Error ? e.message : "EXECUTION_FAILED",
       reason: "SERVER_ERROR",
     };
+
+    if (req.idempotencyKey) {
+      await storeIdempotencyKey(env, serviceCreds, addInId, req.idempotencyKey, errorResult);
+    }
+
+    return errorResult;
   }
 }
 
@@ -299,3 +321,81 @@ export function buildAuditRecord(
     },
   };
 }
+
+/*───────────────────── Idempotency Key Management ─────────────────────*/
+
+/* Server-side idempotency for protected operations.
+   Stores processed keys in AddInData so duplicate requests return the cached result
+   instead of re-executing the operation. This prevents replay attacks where a
+   client resubmits the same protected operation.
+
+   Does NOT provide atomic exactly-once execution — AddInData has no transactions.
+   If two requests with the same key arrive simultaneously, both may execute.
+   The idempotency check reduces but does not eliminate replay risk. */
+
+const IDEMPOTENCY_RECORD_TYPE = "idempotency_key";
+
+/* Check if an idempotency key has already been processed.
+   Returns the cached result if found, null otherwise. */
+export async function checkIdempotencyKey(
+  env: Env,
+  serviceCreds: { database: string; userName: string; sessionId: string },
+  addInId: string,
+  idempotencyKey: string,
+): Promise<ExecutionResponse | null> {
+  try {
+    const records = await addInDataGet(env, serviceCreds, {
+      addInId,
+      whereClause: `details.idempotencyKey = "${idempotencyKey}"`,
+      resultsLimit: 1,
+    });
+
+    if (!records || records.length === 0) return null;
+
+    const record = records[0];
+    const details = record.details as Record<string, unknown>;
+    if (details.success === true) {
+      return {
+        success: true,
+        recordId: details.recordId as string,
+        actorUserId: details.actorUserId as string,
+      };
+    }
+    return {
+      success: false,
+      error: (details.error as string) || "UNKNOWN_ERROR",
+      reason: (details.reason as string) || "UNKNOWN_REASON",
+    };
+  } catch {
+    return null;
+  }
+}
+
+/* Store an idempotency key result in AddInData for future duplicate detection. */
+export async function storeIdempotencyKey(
+  env: Env,
+  serviceCreds: { database: string; userName: string; sessionId: string },
+  addInId: string,
+  idempotencyKey: string,
+  result: ExecutionResponse,
+): Promise<void> {
+  const details: Record<string, unknown> = {
+    recordType: IDEMPOTENCY_RECORD_TYPE,
+    schemaVersion: 1,
+    idempotencyKey,
+    success: result.success,
+    timestamp: new Date().toISOString(),
+  };
+  if (result.success) {
+    details.recordId = (result as { recordId: string }).recordId;
+    details.actorUserId = (result as { actorUserId: string }).actorUserId;
+  } else {
+    details.error = (result as { error: string }).error;
+    details.reason = (result as { reason: string }).reason;
+  }
+  await addInDataAdd(env, serviceCreds, {
+    addInId,
+    details,
+  });
+}
+

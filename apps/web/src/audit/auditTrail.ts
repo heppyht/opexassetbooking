@@ -104,6 +104,11 @@ let pendingQueue: OpexAuditPending[] = [];
 let queueState: AuditPendingState = "idle";
 let recoveryInProgress = false;
 
+/* Cumulative recovery statistics for observability. */
+let totalRecovered = 0;
+let totalFailed = 0;
+let lastRecoveryError: string | null = null;
+
 /* Build the full audit event payload that was attempted, so it can be
    reconstructed into an OpexBookingAudit record on retry. */
 function buildAuditRecordInput(
@@ -207,6 +212,8 @@ export async function recoverAuditPending(
     const createAuditRecord = provider.createAuditRecord;
     if (typeof createAuditRecord !== "function") {
       failed += 1;
+      totalFailed += 1;
+      lastRecoveryError = "AUDIT_PROVIDER_UNAVAILABLE";
       continue;
     }
     try {
@@ -221,14 +228,17 @@ export async function recoverAuditPending(
       await provider.deleteAuditPending(pending.id);
       pendingQueue = pendingQueue.filter(p => p.id !== pending.id);
       recovered += 1;
+      totalRecovered += 1;
     } catch (e) {
       const errorMsg = e instanceof Error ? e.message : "AUDIT_WRITE_FAILED";
       pending.retry_count += 1;
       pending.last_error = errorMsg;
+      lastRecoveryError = errorMsg;
       if (pending.retry_count >= (pending.max_retries ?? MAX_RETRIES)) {
         pendingQueue = pendingQueue.filter(p => p.id !== pending.id);
         await provider.deleteAuditPending(pending.id);
         failed += 1;
+        totalFailed += 1;
       } else {
         pending.next_retry_at = nextRetryAt(pending.retry_count);
         try {
@@ -247,6 +257,7 @@ export async function recoverAuditPending(
           /* best-effort update */
         }
         failed += 1;
+        totalFailed += 1;
       }
     }
   }
@@ -265,8 +276,8 @@ export async function recoverAuditPending(
 export function getAuditQueueState(): AuditRecoveryStats {
   return {
     pendingCount: pendingQueue.length,
-    recoveredCount: 0,
-    failedCount: 0,
+    recoveredCount: totalRecovered,
+    failedCount: totalFailed,
     state: queueState,
   };
 }

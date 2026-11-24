@@ -33,6 +33,7 @@ export interface AuthorizationRequest {
   sessionId: string;
   database: string;
   server: string;
+  userName: string;
   action: BookingAction;
   bookingId?: string;
   actorUserId?: string;
@@ -46,9 +47,11 @@ export interface ExecutionRequest {
   sessionId: string;
   database: string;
   server: string;
+  userName: string;
   action: BookingAction;
   bookingId: string;
   bookingData?: Record<string, unknown>;
+  idempotencyKey?: string;
 }
 
 export type ExecutionResponse =
