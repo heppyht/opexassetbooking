@@ -69,7 +69,7 @@ export interface BookingValidationResult {
    entity store. Every persistent record carries recordType and
    schemaVersion so the client can normalize legacy records and evolve
    the schema without server-side migrations. */
-export type RecordType = "booking" | "booking_audit" | "notification" | "vehicle_hold";
+export type RecordType = "booking" | "booking_audit" | "notification" | "vehicle_hold" | "audit_dead_letter";
 
 export const SCHEMA_VERSION = 1;
 
@@ -257,7 +257,7 @@ export interface OpexBookingAudit {
 
 /*───────────────────── Audit pending queue (retry/recovery) ─────────────────────*/
 /* Audit records that failed to write to AddInData are stored here as pending
-   records with recordType "audit_pending". A recovery process retries them
+   records with recordType "booking_audit". A recovery process retries them
    with exponential backoff until they succeed or reach max attempts. */
 export interface OpexAuditPending {
   recordType: RecordType;
@@ -274,6 +274,40 @@ export interface OpexAuditPending {
   max_retries: number;
   last_error: string | null;
   next_retry_at: string | null;
+}
+
+/*───────────────────── Audit dead letter (exhausted retries) ─────────────────────*/
+/* Audit records that exceed max_retries are moved to dead-letter state instead
+   of being deleted. This preserves the original event, error, and retry metadata
+   for later inspection and manual recovery. */
+export interface OpexAuditDeadLetter {
+  recordType: RecordType;
+  schemaVersion: number;
+  id: string;
+  booking_id: string;
+  action: string;
+  actor_user_id: string;
+  previous_status: string | null;
+  new_status: string | null;
+  details: string | null;
+  created_at: string;
+  retry_count: number;
+  max_retries: number;
+  last_error: string | null;
+  next_retry_at: string | null;
+  dead_lettered_at: string;
+  original_pending_id: string;
+}
+
+/*───────────────────── Audit reconciliation ─────────────────────*/
+/* Result of reconciling bookings against audit records to find
+   bookings that are missing expected audit events. */
+export interface AuditReconciliationResult {
+  booking_id: string;
+  booking_status: string;
+  missing_audit_actions: string[];
+  last_audit_action: string | null;
+  last_audit_timestamp: string | null;
 }
 
 /*───────────────────── Notification Provider Interface ─────────────────────*/
@@ -306,5 +340,7 @@ export interface NotificationDataProvider {
   createAuditPending(input: Omit<OpexAuditPending, "id" | "schemaVersion" | "recordType" | "created_at" | "retry_count" | "next_retry_at" | "max_retries" | "last_error">): Promise<OpexAuditPending>;
   getAuditPending(): Promise<OpexAuditPending[]>;
   deleteAuditPending(id: string): Promise<void>;
+  createAuditDeadLetter(input: Omit<OpexAuditDeadLetter, "id" | "schemaVersion" | "recordType" | "created_at" | "dead_lettered_at">): Promise<OpexAuditDeadLetter>;
+  getAuditDeadLetters(): Promise<OpexAuditDeadLetter[]>;
   isLive(): boolean;
 }

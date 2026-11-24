@@ -18,6 +18,7 @@ import type {
   OpexNotification,
   OpexBookingAudit,
   OpexAuditPending,
+  OpexAuditDeadLetter,
   NotificationType,
   RecordType,
 } from "./types";
@@ -58,6 +59,7 @@ function diagLog(message: string, detail?: unknown): void {
 const NOTIFICATION_GROUP_ID = DEFAULT_GROUP_ID;
 const AUDIT_GROUP_ID = DEFAULT_GROUP_ID;
 const AUDIT_PENDING_GROUP_ID = DEFAULT_GROUP_ID;
+const AUDIT_DEAD_LETTER_GROUP_ID = DEFAULT_GROUP_ID;
 
 function assertDetailsWithinLimit(value: unknown): void {
   const json = JSON.stringify(value);
@@ -90,6 +92,13 @@ function serializeAuditPending(p: OpexAuditPending): OpexAuditPending {
 }
 function deserializeAuditPending(details: AddInDataDetails): OpexAuditPending {
   return toDetailsObject<OpexAuditPending>(details);
+}
+function serializeAuditDeadLetter(p: OpexAuditDeadLetter): OpexAuditDeadLetter {
+  assertDetailsWithinLimit(p);
+  return p;
+}
+function deserializeAuditDeadLetter(details: AddInDataDetails): OpexAuditDeadLetter {
+  return toDetailsObject<OpexAuditDeadLetter>(details);
 }
 
 /*───────────────────── Raw MyGeotab record shapes ─────────────────────*/
@@ -796,6 +805,53 @@ export class AddInDataBookingDataProvider implements BookingDataProvider, Notifi
         id: record.id,
       },
     });
+  }
+
+  async createAuditDeadLetter(input: Omit<OpexAuditDeadLetter, "id" | "schemaVersion" | "recordType" | "created_at" | "dead_lettered_at">): Promise<OpexAuditDeadLetter> {
+    const now = new Date().toISOString();
+    const record: OpexAuditDeadLetter = {
+      recordType: "audit_dead_letter",
+      schemaVersion: SCHEMA_VERSION,
+      id: generateBusinessId(),
+      booking_id: input.booking_id,
+      action: input.action,
+      actor_user_id: input.actor_user_id,
+      previous_status: input.previous_status,
+      new_status: input.new_status,
+      details: input.details,
+      created_at: now,
+      retry_count: input.retry_count,
+      max_retries: input.max_retries,
+      last_error: input.last_error,
+      next_retry_at: input.next_retry_at,
+      dead_lettered_at: now,
+      original_pending_id: input.original_pending_id,
+    };
+    const detailsStr = serializeAuditDeadLetter(record);
+    await this.apiCall<{ id?: string }>("Add", {
+      typeName: "AddInData",
+      entity: {
+        addInId: this.addInId,
+        details: detailsStr,
+        groups: [{ id: AUDIT_DEAD_LETTER_GROUP_ID }],
+      },
+    });
+    return record;
+  }
+
+  async getAuditDeadLetters(): Promise<OpexAuditDeadLetter[]> {
+    const records = await this.apiCall<AddInDataRecord[]>("Get", {
+      typeName: "AddInData",
+      search: { addInId: this.addInId },
+    });
+    return (records || [])
+      .map(r => deserializeAuditDeadLetter(r.details))
+      .filter(d => d.recordType === "audit_dead_letter")
+      .sort((a, b) => {
+        const da = a.dead_lettered_at ? new Date(a.dead_lettered_at).getTime() : 0;
+        const db = b.dead_lettered_at ? new Date(b.dead_lettered_at).getTime() : 0;
+        return db - da;
+      });
   }
 
   isLive(): boolean {

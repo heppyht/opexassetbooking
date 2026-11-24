@@ -27,6 +27,7 @@ import {
   verifySession,
 } from "./integrations/mygeotab/client.ts";
 import type { AddInDataAddInput } from "./integrations/mygeotab/client.ts";
+import { computePayloadFingerprint } from "./crypto.ts";
 
 /*───────────────────── Role Hierarchy ─────────────────────*/
 
@@ -190,16 +191,60 @@ export async function handleExecute(
     };
   }
 
-  /* 3. Get service account credentials for AddInData access */
-  const serviceCreds = await serviceSession.getCredentials();
-
-  /* 3a. Check idempotency key — return cached result if already processed */
-  if (req.idempotencyKey) {
-    const cached = await checkIdempotencyKey(env, serviceCreds, addInId, req.idempotencyKey);
-    if (cached) return cached;
+  /* 3. Require idempotency key on all protected operations */
+  if (!req.idempotencyKey) {
+    return {
+      success: false,
+      error: "IDEMPOTENCY_KEY_REQUIRED",
+      reason: "IDEMPOTENCY_KEY_REQUIRED",
+    };
   }
 
-  /* 4. Build the booking record with verified actor attribution */
+  /* 4. Compute payload fingerprint for conflict detection.
+     Fails closed if SHA-256 is unavailable — protected operations cannot
+     proceed without a verifiable fingerprint. */
+  let payloadFingerprint: string;
+  try {
+    payloadFingerprint = await computePayloadFingerprint({
+      action: req.action,
+      bookingId: req.bookingId,
+      bookingData: req.bookingData,
+    });
+  } catch (e) {
+    return {
+      success: false,
+      error: e instanceof Error ? e.message : "FINGERPRINT_FAILED",
+      reason: "FINGERPRINT_FAILED",
+    };
+  }
+
+  /* 5. Get service account credentials for AddInData access */
+  const serviceCreds = await serviceSession.getCredentials();
+
+  /* 6. Check idempotency key — return cached result if already processed */
+  const idemCheck = await checkIdempotencyKey(
+    env,
+    serviceCreds,
+    addInId,
+    req.idempotencyKey,
+    payloadFingerprint,
+    principal.userName,
+    req.action,
+    req.bookingId,
+  );
+
+  if (idemCheck.found) {
+    if ("conflict" in idemCheck && idemCheck.conflict) {
+      return {
+        success: false,
+        error: "IDEMPOTENCY_KEY_CONFLICT",
+        reason: `Idempotency key "${req.idempotencyKey}" was previously used with a different payload.`,
+      };
+    }
+    return (idemCheck as { found: true; result: ExecutionResponse }).result;
+  }
+
+  /* 7. Build the booking record with verified actor attribution */
   const now = new Date().toISOString();
   const recordDetails: Record<string, unknown> = {
     recordType: "booking",
@@ -213,7 +258,7 @@ export async function handleExecute(
     ...(req.bookingData || {}),
   };
 
-  /* 5. Perform AddInData write using service account (trusted, not client) */
+  /* 8. Perform AddInData write using service account (trusted, not client) */
   const addInput: AddInDataAddInput = {
     addInId,
     details: recordDetails,
@@ -222,7 +267,7 @@ export async function handleExecute(
   try {
     const result = await addInDataAdd(env, serviceCreds, addInput);
 
-    /* 6. Record audit event with verified actor */
+    /* 9. Record audit event with verified actor */
     const auditDetails: Record<string, unknown> = {
       recordType: "booking_audit",
       schemaVersion: 1,
@@ -247,7 +292,17 @@ export async function handleExecute(
     };
 
     if (req.idempotencyKey) {
-      await storeIdempotencyKey(env, serviceCreds, addInId, req.idempotencyKey, executionResult);
+      await storeIdempotencyKey(
+        env,
+        serviceCreds,
+        addInId,
+        req.idempotencyKey,
+        executionResult,
+        payloadFingerprint,
+        principal.userName,
+        req.action,
+        req.bookingId,
+      );
     }
 
     return executionResult;
@@ -259,7 +314,17 @@ export async function handleExecute(
     };
 
     if (req.idempotencyKey) {
-      await storeIdempotencyKey(env, serviceCreds, addInId, req.idempotencyKey, errorResult);
+      await storeIdempotencyKey(
+        env,
+        serviceCreds,
+        addInId,
+        req.idempotencyKey,
+        errorResult,
+        payloadFingerprint,
+        principal.userName,
+        req.action,
+        req.bookingId,
+      );
     }
 
     return errorResult;
@@ -331,18 +396,28 @@ export function buildAuditRecord(
 
    Does NOT provide atomic exactly-once execution — AddInData has no transactions.
    If two requests with the same key arrive simultaneously, both may execute.
-   The idempotency check reduces but does not eliminate replay risk. */
+   The idempotency check reduces but does not eliminate replay risk.
+
+   Keys are scoped to (actorUserId, action, bookingId). If the same key is
+   presented with a different payload fingerprint, the request is rejected with
+   IDEMPOTENCY_KEY_CONFLICT. */
 
 const IDEMPOTENCY_RECORD_TYPE = "idempotency_key";
 
 /* Check if an idempotency key has already been processed.
-   Returns the cached result if found, null otherwise. */
+   Returns the cached result if found and fingerprint matches.
+   Returns null if key not found (proceed with execution).
+   Throws IDEMPOTENCY_KEY_CONFLICT if key exists but fingerprint differs. */
 export async function checkIdempotencyKey(
   env: Env,
   serviceCreds: { database: string; userName: string; sessionId: string },
   addInId: string,
   idempotencyKey: string,
-): Promise<ExecutionResponse | null> {
+  payloadFingerprint?: string,
+  actorUserId?: string,
+  action?: string,
+  bookingId?: string,
+): Promise<{ found: true; result: ExecutionResponse } | { found: false } | { found: true; conflict: true }> {
   try {
     const records = await addInDataGet(env, serviceCreds, {
       addInId,
@@ -350,24 +425,64 @@ export async function checkIdempotencyKey(
       resultsLimit: 1,
     });
 
-    if (!records || records.length === 0) return null;
+    if (!records || records.length === 0) {
+      return { found: false };
+    }
 
     const record = records[0];
     const details = record.details as Record<string, unknown>;
+
+    /* Verify key scoping: actor, action, bookingId must match */
+    if (
+      actorUserId !== undefined &&
+      details.actorUserId !== undefined &&
+      details.actorUserId !== actorUserId
+    ) {
+      return { found: true, conflict: true };
+    }
+    if (
+      action !== undefined &&
+      details.action !== undefined &&
+      details.action !== action
+    ) {
+      return { found: true, conflict: true };
+    }
+    if (
+      bookingId !== undefined &&
+      details.bookingId !== undefined &&
+      details.bookingId !== bookingId
+    ) {
+      return { found: true, conflict: true };
+    }
+
+    /* Verify payload fingerprint */
+    if (payloadFingerprint !== undefined && details.payloadFingerprint !== undefined) {
+      if (details.payloadFingerprint !== payloadFingerprint) {
+        return { found: true, conflict: true };
+      }
+    }
+
+    /* Cached result found */
     if (details.success === true) {
       return {
-        success: true,
-        recordId: details.recordId as string,
-        actorUserId: details.actorUserId as string,
+        found: true,
+        result: {
+          success: true,
+          recordId: details.recordId as string,
+          actorUserId: details.actorUserId as string,
+        },
       };
     }
     return {
-      success: false,
-      error: (details.error as string) || "UNKNOWN_ERROR",
-      reason: (details.reason as string) || "UNKNOWN_REASON",
+      found: true,
+      result: {
+        success: false,
+        error: (details.error as string) || "UNKNOWN_ERROR",
+        reason: (details.reason as string) || "UNKNOWN_REASON",
+      },
     };
   } catch {
-    return null;
+    return { found: false };
   }
 }
 
@@ -378,6 +493,10 @@ export async function storeIdempotencyKey(
   addInId: string,
   idempotencyKey: string,
   result: ExecutionResponse,
+  payloadFingerprint?: string,
+  actorUserId?: string,
+  action?: string,
+  bookingId?: string,
 ): Promise<void> {
   const details: Record<string, unknown> = {
     recordType: IDEMPOTENCY_RECORD_TYPE,
@@ -386,6 +505,18 @@ export async function storeIdempotencyKey(
     success: result.success,
     timestamp: new Date().toISOString(),
   };
+  if (payloadFingerprint !== undefined) {
+    details.payloadFingerprint = payloadFingerprint;
+  }
+  if (actorUserId !== undefined) {
+    details.actorUserId = actorUserId;
+  }
+  if (action !== undefined) {
+    details.action = action;
+  }
+  if (bookingId !== undefined) {
+    details.bookingId = bookingId;
+  }
   if (result.success) {
     details.recordId = (result as { recordId: string }).recordId;
     details.actorUserId = (result as { actorUserId: string }).actorUserId;

@@ -52,6 +52,8 @@ export interface ExecutionRequest {
   bookingId: string;
   bookingData?: Record<string, unknown>;
   idempotencyKey?: string;
+  /** SHA-256 hex digest of the request payload, used to detect conflicting payloads under the same key. */
+  payloadFingerprint?: string;
 }
 
 export type ExecutionResponse =

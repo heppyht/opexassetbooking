@@ -15,6 +15,7 @@ import type {
   OpexNotification,
   OpexBookingAudit,
   OpexAuditPending,
+  OpexAuditDeadLetter,
   NotificationType,
 } from "./types";
 import { SCHEMA_VERSION, generateBusinessId } from "./types.ts";
@@ -140,6 +141,7 @@ export class LocalBookingDataProvider implements BookingDataProvider, Notificati
   private notifications: OpexNotification[];
   private auditRecords: OpexBookingAudit[];
   private pendingAuditRecords: OpexAuditPending[];
+  private deadLetterRecords: OpexAuditDeadLetter[];
 
   constructor() {
     this.devices = [...mockMyGeotabDevices];
@@ -151,6 +153,7 @@ export class LocalBookingDataProvider implements BookingDataProvider, Notificati
     this.notifications = [];
     this.auditRecords = [];
     this.pendingAuditRecords = [];
+    this.deadLetterRecords = [];
   }
 
   /*â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€ Master data â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€*/
@@ -401,6 +404,39 @@ export class LocalBookingDataProvider implements BookingDataProvider, Notificati
 
   async deleteAuditPending(id: string): Promise<void> {
     this.pendingAuditRecords = this.pendingAuditRecords.filter(p => p.id !== id);
+  }
+
+  async createAuditDeadLetter(input: Omit<OpexAuditDeadLetter, "id" | "schemaVersion" | "recordType" | "created_at" | "dead_lettered_at">): Promise<OpexAuditDeadLetter> {
+    const now = new Date().toISOString();
+    const record: OpexAuditDeadLetter = {
+      recordType: "audit_dead_letter",
+      schemaVersion: SCHEMA_VERSION,
+      id: generateBusinessId(),
+      booking_id: input.booking_id,
+      action: input.action,
+      actor_user_id: input.actor_user_id,
+      previous_status: input.previous_status,
+      new_status: input.new_status,
+      details: input.details,
+      created_at: now,
+      retry_count: input.retry_count,
+      max_retries: input.max_retries,
+      last_error: input.last_error,
+      next_retry_at: input.next_retry_at,
+      dead_lettered_at: now,
+      original_pending_id: input.original_pending_id,
+    };
+    this.deadLetterRecords.push(record);
+    return record;
+  }
+
+  async getAuditDeadLetters(): Promise<OpexAuditDeadLetter[]> {
+    return [...this.deadLetterRecords]
+      .sort((a, b) => {
+        const da = a.dead_lettered_at ? new Date(a.dead_lettered_at).getTime() : 0;
+        const db = b.dead_lettered_at ? new Date(b.dead_lettered_at).getTime() : 0;
+        return db - da;
+      });
   }
 
   isLive(): boolean {

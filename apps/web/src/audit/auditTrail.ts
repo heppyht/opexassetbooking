@@ -1,4 +1,4 @@
-﻿import type { BookingDataProvider, NotificationDataProvider, OpexAuditPending, OpexBookingAudit, ResolvedBooking } from "../data/types";
+﻿import type { BookingDataProvider, NotificationDataProvider, OpexAuditDeadLetter, OpexAuditPending, OpexBookingAudit, AuditReconciliationResult, ResolvedBooking } from "../data/types";
 import type { AppMode } from "../auth/identityResolver";
 import type { IdentityResolutionState } from "../auth/identityResolver";
 
@@ -235,10 +235,44 @@ export async function recoverAuditPending(
       pending.last_error = errorMsg;
       lastRecoveryError = errorMsg;
       if (pending.retry_count >= (pending.max_retries ?? MAX_RETRIES)) {
-        pendingQueue = pendingQueue.filter(p => p.id !== pending.id);
-        await provider.deleteAuditPending(pending.id);
-        failed += 1;
-        totalFailed += 1;
+        /* Move to dead-letter state instead of deleting — preserves original
+           event, error, and retry metadata for later inspection.
+
+           Processing order:
+           1. Create dead-letter record first.
+           2. Only after successful creation, delete the pending record.
+           3. If creation fails, retain the pending record for later retry.
+           This ensures no audit event is silently lost. */
+        const notifProvider = provider as NotificationDataProvider;
+        let deadLetterCreated = false;
+        try {
+          await notifProvider.createAuditDeadLetter?.({
+            booking_id: pending.booking_id,
+            action: pending.action,
+            actor_user_id: pending.actor_user_id,
+            previous_status: pending.previous_status,
+            new_status: pending.new_status,
+            details: pending.details,
+            retry_count: pending.retry_count,
+            max_retries: pending.max_retries,
+            last_error: pending.last_error,
+            next_retry_at: pending.next_retry_at,
+            original_pending_id: pending.id,
+          });
+          deadLetterCreated = true;
+        } catch {
+          /* Dead-letter creation failed — retain pending record for retry. */
+          lastRecoveryError = "DEAD_LETTER_CREATION_FAILED";
+        }
+
+        if (deadLetterCreated) {
+          await provider.deleteAuditPending(pending.id);
+          pendingQueue = pendingQueue.filter(p => p.id !== pending.id);
+          failed += 1;
+          totalFailed += 1;
+        }
+        /* If dead-letter creation failed, the pending record stays in the
+           queue and will be retried on the next recovery cycle. */
       } else {
         pending.next_retry_at = nextRetryAt(pending.retry_count);
         try {
@@ -345,5 +379,73 @@ export async function emitAuditEvent(input: AuditEmitInput): Promise<AuditEmitRe
     const notifProvider = provider as NotificationDataProvider;
     await queueAuditPending(notifProvider, input, actorUserId, errorMsg);
     return { ok: false, error: errorMsg };
+  }
+}
+
+/*───────────────────── Audit reconciliation ─────────────────────*/
+
+/* Compare bookings against audit records to find bookings missing expected
+   audit events. This detects bookings that were modified directly (bypassing
+   the audit trail) or where audit writes failed and were not recovered. */
+export function reconcileAudit(
+  bookings: ResolvedBooking[],
+  audits: OpexBookingAudit[],
+): AuditReconciliationResult[] {
+  /* Build a map of booking_id -> latest audit action for that booking */
+  const auditByBooking = new Map<string, { action: string; timestamp: string }[]>();
+  for (const audit of audits) {
+    const existing = auditByBooking.get(audit.booking_id) ?? [];
+    existing.push({ action: audit.action, timestamp: audit.created_at });
+    auditByBooking.set(audit.booking_id, existing);
+  }
+
+  const results: AuditReconciliationResult[] = [];
+
+  for (const booking of bookings) {
+    const auditsForBooking = auditByBooking.get(booking.id) ?? [];
+    const lastAudit = auditsForBooking.length > 0
+      ? auditsForBooking.sort((a, b) => new Date(b.timestamp).getTime() - new Date(a.timestamp).getTime())[0]
+      : null;
+
+    /* Determine expected audit actions for the booking's current status */
+    const expectedActions = expectedAuditActionsForStatus(booking.status);
+    const missingActions = expectedActions.filter(
+      expected => !auditsForBooking.some(a => a.action === expected),
+    );
+
+    if (missingActions.length > 0) {
+      results.push({
+        booking_id: booking.id,
+        booking_status: booking.status,
+        missing_audit_actions: missingActions,
+        last_audit_action: lastAudit?.action ?? null,
+        last_audit_timestamp: lastAudit?.timestamp ?? null,
+      });
+    }
+  }
+
+  return results;
+}
+
+/* Expected audit actions for a given booking status. */
+function expectedAuditActionsForStatus(status: string): string[] {
+  switch (status) {
+    case "PENDING_APPROVAL":
+      return ["BOOKING_CREATED"];
+    case "APPROVED":
+      return ["BOOKING_CREATED", "BOOKING_APPROVED"];
+    case "REJECTED":
+      return ["BOOKING_CREATED", "BOOKING_REJECTED"];
+    case "ASSIGNED":
+      return ["BOOKING_CREATED", "BOOKING_APPROVED", "VEHICLE_ASSIGNED"];
+    case "COMPLETED":
+      return ["BOOKING_CREATED", "BOOKING_APPROVED", "VEHICLE_ASSIGNED", "BOOKING_COMPLETED"];
+    case "CANCELLED":
+      return ["BOOKING_CREATED", "BOOKING_CANCELLED"];
+    case "DRAFT":
+    case "SUBMITTED":
+      return ["BOOKING_CREATED"];
+    default:
+      return [];
   }
 }
