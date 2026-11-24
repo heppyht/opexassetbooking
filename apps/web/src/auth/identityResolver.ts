@@ -6,6 +6,7 @@ export type SessionContext = {
   userName?: string;
   database?: string;
   server?: string;
+  sessionId?: string;
 };
 
 export type VerifiedPrincipal = {
@@ -36,6 +37,7 @@ function toSessionContext(session: unknown): SessionContext {
     userName: typeof s.userName === "string" ? s.userName : undefined,
     database: typeof s.database === "string" ? s.database : undefined,
     server: typeof s.server === "string" ? s.server : undefined,
+    sessionId: typeof s.sessionId === "string" ? s.sessionId : undefined,
   };
 }
 
@@ -174,4 +176,27 @@ export function getActorIdForMode(
     return identity && identity.status === "authenticated" ? identity.principal.id : null;
   }
   return demoActorId && demoActorId.trim() ? demoActorId : null;
+}
+
+/*───────────────────── Session Credentials for Server-Side Verification ─────────────────────*/
+
+/* Returns the session credentials needed to verify identity with the server-side
+   authorization API. Only available when identity is authenticated in ADDIN_DATA mode.
+   Never returns passwords or other secrets. */
+export function getSessionCredentials(
+  mode: AppMode,
+  identity: IdentityResolutionState | null | undefined,
+): { sessionId: string; database: string; server: string; userName: string } | null {
+  if (mode !== "ADDIN_DATA") return null;
+  if (!identity || identity.status !== "authenticated") return null;
+  const { session } = identity;
+  if (!session?.sessionId || !session?.database || !session?.server || !session?.userName) {
+    return null;
+  }
+  return {
+    sessionId: session.sessionId,
+    database: session.database,
+    server: session.server,
+    userName: session.userName,
+  };
 }

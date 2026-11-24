@@ -92,7 +92,7 @@ test("create → read → approve resolves by server record ID", async () => {
   assert.ok(created.id.startsWith("rec-"), `Expected server record ID, got ${created.id}`);
 
   // Approve uses the server record ID returned from createBooking
-  await provider.updateBookingStatus(created.id, "APPROVED", "u102");
+  await provider.updateBookingStatus(created.id, "APPROVED", created.version, "u102");
 
   // Verify Set used the server record ID (rec-N), not the client booking id
   const setCalls = api.calls.filter(c => c.method === "Set");
@@ -105,7 +105,7 @@ test("create → read → approve resolves by server record ID", async () => {
 test("create → read → reject resolves by server record ID", async () => {
   const { provider, api } = await createProvider();
   const created = await provider.createBooking(baseBookingInput());
-  await provider.updateBookingStatus(created.id, "REJECTED", "u102", "Not approved");
+  await provider.updateBookingStatus(created.id, "REJECTED", created.version, "u102", "Not approved");
 
   const setCalls = api.calls.filter(c => c.method === "Set");
   assert.ok(setCalls.length > 0);
@@ -116,8 +116,8 @@ test("create → read → reject resolves by server record ID", async () => {
 test("create → read → complete resolves by server record ID", async () => {
   const { provider, api } = await createProvider();
   const created = await provider.createBooking(baseBookingInput());
-  await provider.updateBookingStatus(created.id, "ASSIGNED", "u102");
-  await provider.updateBookingStatus(created.id, "COMPLETED", "u102");
+  await provider.updateBookingStatus(created.id, "ASSIGNED", created.version, "u102");
+  await provider.updateBookingStatus(created.id, "COMPLETED", created.version + 1, "u102");
 
   const setCalls = api.calls.filter(c => c.method === "Set");
   assert.ok(setCalls.length >= 2);
@@ -128,7 +128,7 @@ test("create → read → complete resolves by server record ID", async () => {
 test("create → read → cancel resolves by server record ID", async () => {
   const { provider, api } = await createProvider();
   const created = await provider.createBooking(baseBookingInput());
-  await provider.updateBookingStatus(created.id, "CANCELLED", "u102");
+  await provider.updateBookingStatus(created.id, "CANCELLED", created.version, "u102");
 
   const setCalls = api.calls.filter(c => c.method === "Set");
   assert.ok(setCalls.length > 0);
@@ -143,7 +143,7 @@ test("lookup by server record ID (record.id === bookingId)", async () => {
   assert.ok(created.id.startsWith("rec-"));
 
   // Direct server ID match should find the record
-  await provider.updateBookingStatus(created.id, "APPROVED", "u102");
+  await provider.updateBookingStatus(created.id, "APPROVED", created.version, "u102");
   const setCalls = api.calls.filter(c => c.method === "Set");
   assert.equal(setCalls[setCalls.length - 1].params.entity.id, created.id);
 });
@@ -167,7 +167,7 @@ test("lookup by application ID stored in details (legacy records)", async () => 
   }, () => {}, () => {});
 
   // Lookup by application ID stored in details should resolve the record
-  await provider.updateBookingStatus(clientId, "APPROVED", "u102");
+  await provider.updateBookingStatus(clientId, "APPROVED", 0, "u102");
 
   const setCalls = api.calls.filter(c => c.method === "Set");
   assert.ok(setCalls.length > 0);
@@ -180,11 +180,11 @@ test("lookup by application ID stored in details (legacy records)", async () => 
 test("missing record throws BOOKING_NOT_FOUND", async () => {
   const { provider } = await createProvider();
   await assert.rejects(
-    () => provider.updateBookingStatus("rec-nonexistent", "APPROVED", "u102"),
+    () => provider.updateBookingStatus("rec-nonexistent", "APPROVED", 0, "u102"),
     /BOOKING_NOT_FOUND: rec-nonexistent/
   );
   await assert.rejects(
-    () => provider.updateBookingStatus("addin-nonexistent", "APPROVED", "u102"),
+    () => provider.updateBookingStatus("addin-nonexistent", "APPROVED", 0, "u102"),
     /BOOKING_NOT_FOUND: addin-nonexistent/
   );
 });
@@ -204,7 +204,7 @@ test("malformed details do not crash lookup", async () => {
   }, () => {}, () => {});
 
   // Lookup by server record ID should still work despite malformed record
-  await provider.updateBookingStatus(created.id, "APPROVED", "u102");
+  await provider.updateBookingStatus(created.id, "APPROVED", created.version, "u102");
   const setCalls = api.calls.filter(c => c.method === "Set");
   assert.equal(setCalls[setCalls.length - 1].params.entity.id, created.id);
 });
@@ -224,7 +224,7 @@ test("Set operation uses actual server record ID, not application id", async () 
     },
   }, () => {}, () => {});
 
-  await provider.updateBookingStatus(clientId, "APPROVED", "u102");
+  await provider.updateBookingStatus(clientId, "APPROVED", 0, "u102");
 
   const setCalls = api.calls.filter(c => c.method === "Set");
   const lastSet = setCalls[setCalls.length - 1];
@@ -238,7 +238,7 @@ test("no duplicate booking created during status update", async () => {
   const created = await provider.createBooking(baseBookingInput());
   const addCallsBefore = api.calls.filter(c => c.method === "Add").length;
 
-  await provider.updateBookingStatus(created.id, "APPROVED", "u102");
+  await provider.updateBookingStatus(created.id, "APPROVED", created.version, "u102");
 
   const addCallsAfter = api.calls.filter(c => c.method === "Add").length;
   assert.equal(addCallsAfter, addCallsBefore, "No additional Add calls during status update");
@@ -283,7 +283,7 @@ test("audit actor attribution remains correct", async () => {
   const created = await provider.createBooking(baseBookingInput());
   const approverId = "u102";
 
-  await provider.updateBookingStatus(created.id, "APPROVED", approverId);
+  await provider.updateBookingStatus(created.id, "APPROVED", created.version, approverId);
 
   // Verify the booking was updated (not duplicated) and the Set included
   // the approver attribution in details

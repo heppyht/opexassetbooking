@@ -206,8 +206,8 @@ export class MyGeotabBookingDataProvider implements BookingDataProvider {
     return this.localProvider.createBooking(input);
   }
 
-  async updateBookingStatus(id: string, status: string): Promise<void> {
-    return this.localProvider.updateBookingStatus(id, status);
+  async updateBookingStatus(id: string, status: string, expectedVersion: number, approverId?: string, approvalRemarks?: string): Promise<void> {
+    return this.localProvider.updateBookingStatus(id, status, expectedVersion, approverId, approvalRemarks);
   }
 
   async deleteBooking(id: string): Promise<void> {

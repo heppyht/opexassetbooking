@@ -1,5 +1,6 @@
-﻿import type { BookingDataProvider, NotificationDataProvider, ResolvedBooking } from "../data/types";
+﻿import type { BookingDataProvider, NotificationDataProvider, OpexAuditPending, OpexBookingAudit, ResolvedBooking } from "../data/types";
 import type { AppMode } from "../auth/identityResolver";
+import type { IdentityResolutionState } from "../auth/identityResolver";
 
 export type AuditAction =
   | "BOOKING_CREATED"
@@ -29,6 +30,8 @@ export type AuditEmitInput = {
   entityId: string;
   action: AuditAction;
   actorUserId: string;
+  /** Optional authenticated identity. If provided, actorUserId must match identity.principal.id. */
+  identity?: IdentityResolutionState | null;
   previousStatus?: string | null;
   newStatus?: string | null;
   previous?: AuditFieldSnapshot | null;
@@ -82,10 +85,212 @@ export function diffRelevantFields(previous: AuditFieldSnapshot | null | undefin
   return changed;
 }
 
+/*───────────────────── Audit pending queue (retry/recovery) ─────────────────────*/
+
+export type AuditPendingState = "pending" | "recovering" | "idle";
+
+export interface AuditRecoveryStats {
+  pendingCount: number;
+  recoveredCount: number;
+  failedCount: number;
+  state: AuditPendingState;
+}
+
+const MAX_RETRIES = 5;
+const INITIAL_BACKOFF_MS = 1000;
+const MAX_BACKOFF_MS = 30000;
+
+let pendingQueue: OpexAuditPending[] = [];
+let queueState: AuditPendingState = "idle";
+let recoveryInProgress = false;
+
+/* Build the full audit event payload that was attempted, so it can be
+   reconstructed into an OpexBookingAudit record on retry. */
+function buildAuditRecordInput(
+  input: AuditEmitInput,
+  actorUserId: string,
+): Omit<OpexBookingAudit, "recordType" | "schemaVersion" | "id" | "created_at"> {
+  return {
+    booking_id: input.entityId,
+    action: input.action,
+    actor_user_id: actorUserId,
+    previous_status: input.previousStatus ?? input.previous?.status ?? null,
+    new_status: input.newStatus ?? input.next?.status ?? null,
+    details: input.metadata ? safeJson(input.metadata) : null,
+  };
+}
+
+function backoffMs(retryCount: number): number {
+  return Math.min(INITIAL_BACKOFF_MS * 2 ** retryCount, MAX_BACKOFF_MS);
+}
+
+function nextRetryAt(retryCount: number): string | null {
+  return new Date(Date.now() + backoffMs(retryCount)).toISOString();
+}
+
+/* Store a failed audit write as a pending record for later recovery. */
+async function queueAuditPending(
+  provider: NotificationDataProvider,
+  input: AuditEmitInput,
+  actorUserId: string,
+  error: string,
+): Promise<void> {
+  try {
+    const existing = pendingQueue.find(p =>
+      p.booking_id === input.entityId &&
+      p.action === input.action &&
+      p.actor_user_id === actorUserId &&
+      p.retry_count < p.max_retries,
+    );
+    if (existing) {
+      existing.retry_count += 1;
+      existing.last_error = error;
+      existing.next_retry_at = nextRetryAt(existing.retry_count);
+      await provider.createAuditPending({
+        booking_id: existing.booking_id,
+        action: existing.action,
+        actor_user_id: existing.actor_user_id,
+        previous_status: existing.previous_status,
+        new_status: existing.new_status,
+        details: existing.details,
+      });
+      await provider.deleteAuditPending(existing.id);
+      const idx = pendingQueue.findIndex(p => p.id === existing.id);
+      if (idx >= 0) pendingQueue[idx] = { ...existing };
+      return;
+    }
+    const recordInput = buildAuditRecordInput(input, actorUserId);
+    await provider.createAuditPending({
+      booking_id: recordInput.booking_id,
+      action: recordInput.action,
+      actor_user_id: recordInput.actor_user_id,
+      previous_status: recordInput.previous_status,
+      new_status: recordInput.new_status,
+      details: recordInput.details,
+    });
+  } catch {
+    /* Best-effort queue; if we can't even queue, the audit event is lost. */
+  }
+}
+
+/* Load all pending audit records from the provider into the in-memory queue. */
+async function loadPendingQueue(provider: NotificationDataProvider): Promise<void> {
+  try {
+    pendingQueue = await provider.getAuditPending();
+  } catch {
+    pendingQueue = [];
+  }
+}
+
+/* Retry all pending audit records that are due. Returns recovery stats. */
+export async function recoverAuditPending(
+  provider: NotificationDataProvider,
+): Promise<AuditRecoveryStats> {
+  if (recoveryInProgress) {
+    return { pendingCount: pendingQueue.length, recoveredCount: 0, failedCount: 0, state: queueState };
+  }
+  recoveryInProgress = true;
+  queueState = "recovering";
+
+  await loadPendingQueue(provider);
+
+  const now = new Date();
+  const due = pendingQueue.filter(p => {
+    if (!p.next_retry_at) return true;
+    return new Date(p.next_retry_at) <= now;
+  });
+
+  let recovered = 0;
+  let failed = 0;
+
+  for (const pending of due) {
+    const createAuditRecord = provider.createAuditRecord;
+    if (typeof createAuditRecord !== "function") {
+      failed += 1;
+      continue;
+    }
+    try {
+      await createAuditRecord.call(provider, {
+        booking_id: pending.booking_id,
+        action: pending.action,
+        actor_user_id: pending.actor_user_id,
+        previous_status: pending.previous_status,
+        new_status: pending.new_status,
+        details: pending.details,
+      });
+      await provider.deleteAuditPending(pending.id);
+      pendingQueue = pendingQueue.filter(p => p.id !== pending.id);
+      recovered += 1;
+    } catch (e) {
+      const errorMsg = e instanceof Error ? e.message : "AUDIT_WRITE_FAILED";
+      pending.retry_count += 1;
+      pending.last_error = errorMsg;
+      if (pending.retry_count >= (pending.max_retries ?? MAX_RETRIES)) {
+        pendingQueue = pendingQueue.filter(p => p.id !== pending.id);
+        await provider.deleteAuditPending(pending.id);
+        failed += 1;
+      } else {
+        pending.next_retry_at = nextRetryAt(pending.retry_count);
+        try {
+          const existingIdx = pendingQueue.findIndex(p => p.id === pending.id);
+          if (existingIdx >= 0) pendingQueue[existingIdx] = { ...pending };
+          await provider.createAuditPending({
+            booking_id: pending.booking_id,
+            action: pending.action,
+            actor_user_id: pending.actor_user_id,
+            previous_status: pending.previous_status,
+            new_status: pending.new_status,
+            details: pending.details,
+          });
+          await provider.deleteAuditPending(pending.id);
+        } catch {
+          /* best-effort update */
+        }
+        failed += 1;
+      }
+    }
+  }
+
+  queueState = pendingQueue.length > 0 ? "pending" : "idle";
+  recoveryInProgress = false;
+
+  return {
+    pendingCount: pendingQueue.length,
+    recoveredCount: recovered,
+    failedCount: failed,
+    state: queueState,
+  };
+}
+
+export function getAuditQueueState(): AuditRecoveryStats {
+  return {
+    pendingCount: pendingQueue.length,
+    recoveredCount: 0,
+    failedCount: 0,
+    state: queueState,
+  };
+}
+
+export function resetAuditQueueForTests() {
+  pendingQueue = [];
+  queueState = "idle";
+  recoveryInProgress = false;
+  recentKeys.clear();
+}
+
+/*───────────────────── Audit event emission (with retry queue) ─────────────────────*/
+
 export async function emitAuditEvent(input: AuditEmitInput): Promise<AuditEmitResult> {
-  const { mode, provider, entityId, action, actorUserId } = input;
+  const { mode, provider, entityId, action, actorUserId, identity } = input;
   if (!entityId || !action || !actorUserId) {
     return { ok: false, error: "AUDIT_INVALID_INPUT" };
+  }
+  /* Validate actor identity against the authenticated principal.
+     A caller cannot audit an action on behalf of another user. */
+  if (identity && identity.status === "authenticated") {
+    if (actorUserId.trim() !== identity.principal.id.trim()) {
+      return { ok: false, error: "AUDIT_ACTOR_MISMATCH" };
+    }
   }
   const createAuditRecord = provider.createAuditRecord;
   if (typeof createAuditRecord !== "function") {
@@ -118,8 +323,16 @@ export async function emitAuditEvent(input: AuditEmitInput): Promise<AuditEmitRe
       details,
     });
     recentKeys.add(idem);
+
+    /* Attempt to recover any previously pending audit records after a successful write. */
+    const notifProvider = provider as NotificationDataProvider;
+    void recoverAuditPending(notifProvider);
+
     return { ok: true };
   } catch (e) {
-    return { ok: false, error: e instanceof Error ? e.message : "AUDIT_WRITE_FAILED" };
+    const errorMsg = e instanceof Error ? e.message : "AUDIT_WRITE_FAILED";
+    const notifProvider = provider as NotificationDataProvider;
+    await queueAuditPending(notifProvider, input, actorUserId, errorMsg);
+    return { ok: false, error: errorMsg };
   }
 }

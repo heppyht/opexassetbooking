@@ -12,9 +12,16 @@ import {
   canPerformLiveWrite,
   getLiveBlockedReason,
   getActorIdForMode,
+  getSessionCredentials,
   type IdentityResolutionState,
   type AppMode,
 } from "../auth/identityResolver";
+import {
+  authorizeAction,
+  canPerformAction,
+  type BookingAction,
+} from "../auth/authorization";
+import { ServerAuthzClient } from "../auth/serverAuthzClient";
 import { canRunDemoOnlyOperation, assertDemoOnlyOperation, assertProviderNotLiveForDemoOperation, getStateResetOnModeSwitch, isKnownMode } from "../safety/modeGuards";
 import { emitAuditEvent, snapshotBooking, type AuditAction } from "../audit/auditTrail";
 import { getTenantTimezone, toTenantLocalParts, toIsoFromTenantParts, formatTenantDateTime } from "../config/tenantTimezone";
@@ -23,6 +30,7 @@ import { validateResolvedBooking, type BookingDataQuality } from "../data/bookin
 import { ErrorBoundary } from "./errorBoundary";
 
 const TENANT = import.meta.env.VITE_GEOTAB_DATABASE || "opex_trial";
+const AUTHZ_API_BASE_URL = import.meta.env.VITE_AUTHZ_API_BASE_URL || "";
 
 type GeotabApi = {
   call?: (method: string, params: Record<string, unknown>, success: (result: unknown) => void, error?: (error: unknown) => void) => void;
@@ -1844,6 +1852,12 @@ export default function App() {
   const modeRef = useRef(mode);
   const identityResolveSeq = useRef(0);
 
+  // Server-side authorization client (created once, reused across renders)
+  const serverAuthz = useMemo(() => {
+    if (!AUTHZ_API_BASE_URL) return null;
+    return new ServerAuthzClient({ baseUrl: AUTHZ_API_BASE_URL });
+  }, [AUTHZ_API_BASE_URL]);
+
   // Keep refs in sync with state
   useEffect(() => {
     geotabApiRef.current = geotabApi;
@@ -2053,11 +2067,24 @@ export default function App() {
     pushToast(setToasts, type, text);
   }, []);
 
-  const updateBookingStatus = useCallback(async (id: string, newStatus: string, approverId?: string, approvalRemarks?: string) => {
-    await provider.updateBookingStatus(id, newStatus, approverId, approvalRemarks);
+  const updateBookingStatus = useCallback(async (id: string, newStatus: string, expectedVersion: number, action: BookingAction, approverId?: string, approvalRemarks?: string) => {
+    /* Server-side authorization gate: verify session and enforce RBAC before any write */
+    const creds = getSessionCredentials(mode, identityState);
+    if (!creds || !serverAuthz) {
+      if (mode === "ADDIN_DATA") {
+        throw new Error("SERVER_AUTHZ_NOT_CONFIGURED");
+      }
+    } else {
+      const authz = await serverAuthz.authorize(creds.sessionId, creds.database, creds.server, action, id);
+      if (!authz.authorized) {
+        throw new Error(`NOT_AUTHORIZED: ${authz.error}`);
+      }
+    }
+
+    await provider.updateBookingStatus(id, newStatus, expectedVersion, approverId, approvalRemarks);
     const updated = await provider.getBookings();
     setBookings(updated);
-  }, [provider]);
+  }, [provider, mode, identityState, serverAuthz]);
 
   const onLoadData = useCallback(async () => {
     setLoading(true);
@@ -2167,6 +2194,18 @@ export default function App() {
       setMessage({ type: "error", text: liveBlockedReason || "Authenticated MyGeotab identity could not be verified." });
       return;
     }
+    /* Server-side authorization gate for booking creation */
+    const createCreds = getSessionCredentials(mode, identityState);
+    if (createCreds && serverAuthz) {
+      const createAuthz = await serverAuthz.authorize(createCreds.sessionId, createCreds.database, createCreds.server, "create_booking");
+      if (!createAuthz.authorized) {
+        setMessage({ type: "error", text: `Not authorized to create bookings (requires ${createAuthz.requiredRole ?? "EMPLOYEE"} role).` });
+        return;
+      }
+    } else if (mode === "ADDIN_DATA") {
+      setMessage({ type: "error", text: "Server-side authorization is not configured." });
+      return;
+    }
     try {
       const created = await provider.createBooking({
         deviceId: input.assetId,
@@ -2190,6 +2229,7 @@ export default function App() {
         entityId: created.id,
         action: "BOOKING_CREATED",
         actorUserId: currentActorId,
+        identity: identityState,
         previousStatus: null,
         newStatus: "PENDING_APPROVAL",
         previous: null,
@@ -2227,11 +2267,16 @@ export default function App() {
       setMessage({ type: "error", text: liveBlockedReason || "Authenticated MyGeotab identity could not be verified." });
       return;
     }
+    const authz = authorizeAction("approve_booking", identityState);
+    if (!authz.authorized) {
+      setMessage({ type: "error", text: `Not authorized to approve bookings (requires ${authz.requiredRole ?? "APPROVER"} role).` });
+      return;
+    }
     const approverActor = isLiveMode ? (verifiedPrincipal ? { id: verifiedPrincipal.id, name: verifiedPrincipal.name, roles: verifiedPrincipal.roles } : null) : (demoActor ? { id: demoActor.id, name: demoActor.name, roles: demoActor.roles } : null);
     const approverId = getActorIdForMode(mode, identityState, demoActor?.id ?? null) ?? undefined;
     const previous = bookings.find(b => b.id === id) || null;
     try {
-      await updateBookingStatus(id, "APPROVED", approverId);
+      await updateBookingStatus(id, "APPROVED", previous?.version ?? 0, "approve_booking", approverId);
     } catch (e) {
       setMessage({ type: "error", text: e instanceof Error ? e.message : "Failed to approve booking." });
       return;
@@ -2245,6 +2290,7 @@ export default function App() {
       entityId: id,
       action: "BOOKING_APPROVED",
       actorUserId: approverId || "",
+      identity: identityState,
       previousStatus: previous?.status ?? null,
       newStatus: "APPROVED",
       previous: snapshotBooking(previous),
@@ -2278,12 +2324,18 @@ export default function App() {
       setRejectingId(null);
       return;
     }
+    const authz = authorizeAction("reject_booking", identityState);
+    if (!authz.authorized) {
+      setMessage({ type: "error", text: `Not authorized to reject bookings (requires ${authz.requiredRole ?? "APPROVER"} role).` });
+      setRejectingId(null);
+      return;
+    }
     const approverActor = isLiveMode ? (verifiedPrincipal ? { id: verifiedPrincipal.id, name: verifiedPrincipal.name, roles: verifiedPrincipal.roles } : null) : (demoActor ? { id: demoActor.id, name: demoActor.name, roles: demoActor.roles } : null);
     const approverId = getActorIdForMode(mode, identityState, demoActor?.id ?? null) ?? undefined;
     const previous = bookings.find(b => b.id === id) || null;
     const reason = rejectReason[id] ?? undefined;
     try {
-      await updateBookingStatus(id, "REJECTED", approverId, reason);
+      await updateBookingStatus(id, "REJECTED", previous?.version ?? 0, "reject_booking", approverId, reason);
     } catch (e) {
       setMessage({ type: "error", text: e instanceof Error ? e.message : "Failed to reject booking." });
       return;
@@ -2297,6 +2349,7 @@ export default function App() {
       entityId: id,
       action: "BOOKING_REJECTED",
       actorUserId: approverId || "",
+      identity: identityState,
       previousStatus: previous?.status ?? null,
       newStatus: "REJECTED",
       previous: snapshotBooking(previous),
@@ -2332,10 +2385,15 @@ export default function App() {
       setMessage({ type: "error", text: liveBlockedReason || "Authenticated MyGeotab identity could not be verified." });
       return;
     }
+    const authz = authorizeAction("assign_driver", identityState);
+    if (!authz.authorized) {
+      setMessage({ type: "error", text: `Not authorized to assign drivers (requires ${authz.requiredRole ?? "APPROVER"} role).` });
+      return;
+    }
     const previous = bookings.find(x => x.id === id) || null;
     const actorIdForOp = getActorIdForMode(mode, identityState, demoActor?.id ?? null) ?? undefined;
     try {
-      await updateBookingStatus(id, "ASSIGNED", actorIdForOp);
+      await updateBookingStatus(id, "ASSIGNED", previous?.version ?? 0, "assign_driver", actorIdForOp);
     } catch (e) {
       setMessage({ type: "error", text: e instanceof Error ? e.message : "Failed to assign booking." });
       return;
@@ -2349,6 +2407,7 @@ export default function App() {
       entityId: id,
       action: "VEHICLE_ASSIGNED",
       actorUserId: actorIdForOp || "",
+      identity: identityState,
       previousStatus: previous?.status ?? null,
       newStatus: "ASSIGNED",
       previous: snapshotBooking(previous),
@@ -2381,9 +2440,14 @@ export default function App() {
       return;
     }
     const actorIdForOp = getActorIdForMode(mode, identityState, demoActor?.id ?? null) ?? "";
+    const authz = authorizeAction("complete_booking", identityState);
+    if (!authz.authorized) {
+      setMessage({ type: "error", text: `Not authorized to complete bookings (requires ${authz.requiredRole ?? "EMPLOYEE"} role).` });
+      return;
+    }
     const previous = b;
     try {
-      await updateBookingStatus(id, "COMPLETED", actorIdForOp || undefined);
+      await updateBookingStatus(id, "COMPLETED", previous.version, "complete_booking", actorIdForOp || undefined);
     } catch (e) {
       setMessage({ type: "error", text: e instanceof Error ? e.message : "Failed to complete booking." });
       return;
@@ -2397,6 +2461,7 @@ export default function App() {
       entityId: id,
       action: "BOOKING_COMPLETED",
       actorUserId: actorIdForOp,
+      identity: identityState,
       previousStatus: previous.status,
       newStatus: "COMPLETED",
       previous: snapshotBooking(previous),
@@ -2417,9 +2482,14 @@ export default function App() {
       return;
     }
     const actorIdForOp = getActorIdForMode(mode, identityState, demoActor?.id ?? null) ?? "";
+    const authz = authorizeAction("cancel_booking", identityState);
+    if (!authz.authorized) {
+      setMessage({ type: "error", text: `Not authorized to cancel bookings (requires ${authz.requiredRole ?? "EMPLOYEE"} role).` });
+      return;
+    }
     const previous = b;
     try {
-      await updateBookingStatus(id, "CANCELLED", actorIdForOp || undefined);
+      await updateBookingStatus(id, "CANCELLED", previous.version, "cancel_booking", actorIdForOp || undefined);
     } catch (e) {
       setMessage({ type: "error", text: e instanceof Error ? e.message : "Failed to cancel booking." });
       return;
@@ -2433,6 +2503,7 @@ export default function App() {
       entityId: id,
       action: "BOOKING_CANCELLED",
       actorUserId: actorIdForOp,
+      identity: identityState,
       previousStatus: previous.status,
       newStatus: "CANCELLED",
       previous: snapshotBooking(previous),
