@@ -1,4 +1,4 @@
-/*───────────────────── MyGeotab-Aligned Mock Master Data ─────────────────────*/
+﻿/*â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€ MyGeotab-Aligned Mock Master Data â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€*/
 
 import type {
   MyGeotabDevice,
@@ -8,8 +8,9 @@ import type {
   MyGeotabLogRecord,
   OpexBooking,
 } from "./types";
+import { SCHEMA_VERSION } from "./types.ts";
 
-/*───────────────────── Groups ─────────────────────*/
+/*â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€ Groups â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€*/
 export const mockMyGeotabGroups: MyGeotabGroup[] = [
   { id: "grp-hq", name: "Head Office", parentId: undefined },
   { id: "grp-plantation-a", name: "Plantation A", parentId: "grp-hq" },
@@ -19,7 +20,7 @@ export const mockMyGeotabGroups: MyGeotabGroup[] = [
   { id: "grp-maintenance", name: "Maintenance Fleet", parentId: "grp-hq" },
 ];
 
-/*───────────────────── Assets (16 assets) ─────────────────────*/
+/*â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€ Assets (16 assets) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€*/
 export const mockMyGeotabDevices: MyGeotabDevice[] = [
   {
     id: "dev-001",
@@ -199,7 +200,7 @@ export const mockMyGeotabDevices: MyGeotabDevice[] = [
   },
 ];
 
-/*───────────────────── Users (15 users) ─────────────────────*/
+/*â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€ Users (15 users) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€*/
 export const mockMyGeotabUsers: MyGeotabUser[] = [
   {
     id: "u101",
@@ -369,7 +370,7 @@ export const mockMyGeotabUsers: MyGeotabUser[] = [
   },
 ];
 
-/*───────────────────── Status Data (Simulated Telemetry) ─────────────────────*/
+/*â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€ Status Data (Simulated Telemetry) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€*/
 export const mockMyGeotabStatusData: MyGeotabStatusData[] = [
   {
     id: "sd-001",
@@ -423,7 +424,7 @@ export const mockMyGeotabStatusData: MyGeotabStatusData[] = [
   },
 ];
 
-/*───────────────────── Log Records (Simulated GPS) ─────────────────────*/
+/*â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€ Log Records (Simulated GPS) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€*/
 export const mockMyGeotabLogRecords: MyGeotabLogRecord[] = [
   {
     id: "lr-001",
@@ -454,9 +455,11 @@ export const mockMyGeotabLogRecords: MyGeotabLogRecord[] = [
   },
 ];
 
-/*───────────────────── OPEX Bookings (30 records) ─────────────────────*/
+/*â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€ OPEX Bookings (30 records) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€*/
 export const mockOpexBookings: OpexBooking[] = [
   {
+    recordType: "booking",
+    schemaVersion: SCHEMA_VERSION,
     id: "b001",
     deviceId: "dev-001",
     requesterUserId: "u101",
@@ -477,6 +480,8 @@ export const mockOpexBookings: OpexBooking[] = [
     version: 1,
   },
   {
+    recordType: "booking",
+    schemaVersion: SCHEMA_VERSION,
     id: "b002",
     deviceId: "dev-003",
     requesterUserId: "u102",
@@ -497,6 +502,8 @@ export const mockOpexBookings: OpexBooking[] = [
     version: 1,
   },
   {
+    recordType: "booking",
+    schemaVersion: SCHEMA_VERSION,
     id: "b003",
     deviceId: "dev-002",
     requesterUserId: "u101",
@@ -517,6 +524,8 @@ export const mockOpexBookings: OpexBooking[] = [
     version: 1,
   },
   {
+    recordType: "booking",
+    schemaVersion: SCHEMA_VERSION,
     id: "b004",
     deviceId: "dev-001",
     requesterUserId: "u103",
@@ -537,6 +546,8 @@ export const mockOpexBookings: OpexBooking[] = [
     version: 1,
   },
   {
+    recordType: "booking",
+    schemaVersion: SCHEMA_VERSION,
     id: "b005",
     deviceId: "dev-003",
     requesterUserId: "u102",
@@ -557,6 +568,8 @@ export const mockOpexBookings: OpexBooking[] = [
     version: 1,
   },
   {
+    recordType: "booking",
+    schemaVersion: SCHEMA_VERSION,
     id: "b006",
     deviceId: "dev-005",
     requesterUserId: "u108",
@@ -577,6 +590,8 @@ export const mockOpexBookings: OpexBooking[] = [
     version: 1,
   },
   {
+    recordType: "booking",
+    schemaVersion: SCHEMA_VERSION,
     id: "b007",
     deviceId: "dev-007",
     requesterUserId: "u104",
@@ -597,6 +612,8 @@ export const mockOpexBookings: OpexBooking[] = [
     version: 1,
   },
   {
+    recordType: "booking",
+    schemaVersion: SCHEMA_VERSION,
     id: "b008",
     deviceId: "dev-009",
     requesterUserId: "u109",
@@ -617,6 +634,8 @@ export const mockOpexBookings: OpexBooking[] = [
     version: 1,
   },
   {
+    recordType: "booking",
+    schemaVersion: SCHEMA_VERSION,
     id: "b009",
     deviceId: "dev-011",
     requesterUserId: "u110",
@@ -637,6 +656,8 @@ export const mockOpexBookings: OpexBooking[] = [
     version: 1,
   },
   {
+    recordType: "booking",
+    schemaVersion: SCHEMA_VERSION,
     id: "b010",
     deviceId: "dev-006",
     requesterUserId: "u111",
@@ -657,6 +678,8 @@ export const mockOpexBookings: OpexBooking[] = [
     version: 1,
   },
   {
+    recordType: "booking",
+    schemaVersion: SCHEMA_VERSION,
     id: "b011",
     deviceId: "dev-008",
     requesterUserId: "u105",
@@ -677,6 +700,8 @@ export const mockOpexBookings: OpexBooking[] = [
     version: 1,
   },
   {
+    recordType: "booking",
+    schemaVersion: SCHEMA_VERSION,
     id: "b012",
     deviceId: "dev-009",
     requesterUserId: "u114",
@@ -697,6 +722,8 @@ export const mockOpexBookings: OpexBooking[] = [
     version: 1,
   },
   {
+    recordType: "booking",
+    schemaVersion: SCHEMA_VERSION,
     id: "b013",
     deviceId: "dev-013",
     requesterUserId: "u108",
@@ -717,6 +744,8 @@ export const mockOpexBookings: OpexBooking[] = [
     version: 1,
   },
   {
+    recordType: "booking",
+    schemaVersion: SCHEMA_VERSION,
     id: "b014",
     deviceId: "dev-014",
     requesterUserId: "u115",
@@ -737,6 +766,8 @@ export const mockOpexBookings: OpexBooking[] = [
     version: 1,
   },
   {
+    recordType: "booking",
+    schemaVersion: SCHEMA_VERSION,
     id: "b015",
     deviceId: "dev-015",
     requesterUserId: "u110",
@@ -757,6 +788,8 @@ export const mockOpexBookings: OpexBooking[] = [
     version: 1,
   },
   {
+    recordType: "booking",
+    schemaVersion: SCHEMA_VERSION,
     id: "b016",
     deviceId: "dev-001",
     requesterUserId: "u101",
@@ -777,6 +810,8 @@ export const mockOpexBookings: OpexBooking[] = [
     version: 1,
   },
   {
+    recordType: "booking",
+    schemaVersion: SCHEMA_VERSION,
     id: "b017",
     deviceId: "dev-002",
     requesterUserId: "u111",
@@ -797,6 +832,8 @@ export const mockOpexBookings: OpexBooking[] = [
     version: 1,
   },
   {
+    recordType: "booking",
+    schemaVersion: SCHEMA_VERSION,
     id: "b018",
     deviceId: "dev-003",
     requesterUserId: "u102",
@@ -817,6 +854,8 @@ export const mockOpexBookings: OpexBooking[] = [
     version: 1,
   },
   {
+    recordType: "booking",
+    schemaVersion: SCHEMA_VERSION,
     id: "b019",
     deviceId: "dev-005",
     requesterUserId: "u108",
@@ -837,6 +876,8 @@ export const mockOpexBookings: OpexBooking[] = [
     version: 1,
   },
   {
+    recordType: "booking",
+    schemaVersion: SCHEMA_VERSION,
     id: "b020",
     deviceId: "dev-007",
     requesterUserId: "u104",
@@ -857,6 +898,8 @@ export const mockOpexBookings: OpexBooking[] = [
     version: 1,
   },
   {
+    recordType: "booking",
+    schemaVersion: SCHEMA_VERSION,
     id: "b021",
     deviceId: "dev-008",
     requesterUserId: "u105",
@@ -877,6 +920,8 @@ export const mockOpexBookings: OpexBooking[] = [
     version: 1,
   },
   {
+    recordType: "booking",
+    schemaVersion: SCHEMA_VERSION,
     id: "b022",
     deviceId: "dev-009",
     requesterUserId: "u109",
@@ -897,6 +942,8 @@ export const mockOpexBookings: OpexBooking[] = [
     version: 1,
   },
   {
+    recordType: "booking",
+    schemaVersion: SCHEMA_VERSION,
     id: "b023",
     deviceId: "dev-011",
     requesterUserId: "u110",
@@ -917,6 +964,8 @@ export const mockOpexBookings: OpexBooking[] = [
     version: 1,
   },
   {
+    recordType: "booking",
+    schemaVersion: SCHEMA_VERSION,
     id: "b024",
     deviceId: "dev-013",
     requesterUserId: "u108",
@@ -937,6 +986,8 @@ export const mockOpexBookings: OpexBooking[] = [
     version: 1,
   },
   {
+    recordType: "booking",
+    schemaVersion: SCHEMA_VERSION,
     id: "b025",
     deviceId: "dev-014",
     requesterUserId: "u115",
@@ -957,6 +1008,8 @@ export const mockOpexBookings: OpexBooking[] = [
     version: 1,
   },
   {
+    recordType: "booking",
+    schemaVersion: SCHEMA_VERSION,
     id: "b026",
     deviceId: "dev-015",
     requesterUserId: "u110",
@@ -977,6 +1030,8 @@ export const mockOpexBookings: OpexBooking[] = [
     version: 1,
   },
   {
+    recordType: "booking",
+    schemaVersion: SCHEMA_VERSION,
     id: "b027",
     deviceId: "dev-001",
     requesterUserId: "u101",
@@ -997,6 +1052,8 @@ export const mockOpexBookings: OpexBooking[] = [
     version: 1,
   },
   {
+    recordType: "booking",
+    schemaVersion: SCHEMA_VERSION,
     id: "b028",
     deviceId: "dev-002",
     requesterUserId: "u111",
@@ -1017,6 +1074,8 @@ export const mockOpexBookings: OpexBooking[] = [
     version: 1,
   },
   {
+    recordType: "booking",
+    schemaVersion: SCHEMA_VERSION,
     id: "b029",
     deviceId: "dev-003",
     requesterUserId: "u102",
@@ -1037,6 +1096,8 @@ export const mockOpexBookings: OpexBooking[] = [
     version: 1,
   },
   {
+    recordType: "booking",
+    schemaVersion: SCHEMA_VERSION,
     id: "b030",
     deviceId: "dev-005",
     requesterUserId: "u108",
@@ -1057,3 +1118,5 @@ export const mockOpexBookings: OpexBooking[] = [
     version: 1,
   },
 ];
+
+

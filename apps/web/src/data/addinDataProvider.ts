@@ -9,6 +9,7 @@ import type {
   MyGeotabStatusData,
   MyGeotabLogRecord,
   OpexBooking,
+  OpexVehicleHold,
   ResolvedAsset,
   ResolvedBooking,
   ResolvedUser,
@@ -16,8 +17,12 @@ import type {
   NotificationDataProvider,
   OpexNotification,
   OpexBookingAudit,
+  OpexAuditPending,
+  OpexAuditDeadLetter,
   NotificationType,
+  RecordType,
 } from "./types";
+import { SCHEMA_VERSION, generateBusinessId } from "./types.ts";
 import { isValidAddInId } from "../config/addinId.ts";
 import { validateResolvedBooking } from "./bookingValidation.ts";
 
@@ -30,6 +35,11 @@ type GeotabApi = {
 
 const MAX_DETAILS_CHARS = 10000;
 const DEFAULT_GROUP_ID = "GroupCompanyId";
+const MAX_RETRIES = 5;
+
+function nextRetryAt(retryCount: number): string {
+  return new Date(Date.now() + Math.min(1000 * 2 ** retryCount, 30000)).toISOString();
+}
 
 type AddInDataDetails = string | Record<string, unknown>;
 
@@ -48,6 +58,8 @@ function diagLog(message: string, detail?: unknown): void {
 }
 const NOTIFICATION_GROUP_ID = DEFAULT_GROUP_ID;
 const AUDIT_GROUP_ID = DEFAULT_GROUP_ID;
+const AUDIT_PENDING_GROUP_ID = DEFAULT_GROUP_ID;
+const AUDIT_DEAD_LETTER_GROUP_ID = DEFAULT_GROUP_ID;
 
 function assertDetailsWithinLimit(value: unknown): void {
   const json = JSON.stringify(value);
@@ -65,14 +77,28 @@ function serializeNotification(n: OpexNotification): OpexNotification {
   return n;
 }
 function deserializeNotification(details: AddInDataDetails): OpexNotification {
-  return toDetailsObject<OpexNotification>(details);
+  return normalizeNotification(toDetailsObject<OpexNotification>(details));
 }
 function serializeAudit(a: OpexBookingAudit): OpexBookingAudit {
   assertDetailsWithinLimit(a);
   return a;
 }
 function deserializeAudit(details: AddInDataDetails): OpexBookingAudit {
-  return toDetailsObject<OpexBookingAudit>(details);
+  return normalizeAudit(toDetailsObject<OpexBookingAudit>(details));
+}
+function serializeAuditPending(p: OpexAuditPending): OpexAuditPending {
+  assertDetailsWithinLimit(p);
+  return p;
+}
+function deserializeAuditPending(details: AddInDataDetails): OpexAuditPending {
+  return toDetailsObject<OpexAuditPending>(details);
+}
+function serializeAuditDeadLetter(p: OpexAuditDeadLetter): OpexAuditDeadLetter {
+  assertDetailsWithinLimit(p);
+  return p;
+}
+function deserializeAuditDeadLetter(details: AddInDataDetails): OpexAuditDeadLetter {
+  return toDetailsObject<OpexAuditDeadLetter>(details);
 }
 
 /*───────────────────── Raw MyGeotab record shapes ─────────────────────*/
@@ -193,7 +219,27 @@ function serializeBooking(booking: OpexBooking): OpexBooking {
 }
 
 function deserializeBooking(details: AddInDataDetails): OpexBooking {
-  return toDetailsObject<OpexBooking>(details);
+  return normalizeBooking(toDetailsObject<OpexBooking>(details));
+}
+
+/*───────────────────── Legacy schema normalization ─────────────────────*/
+/* Ensures legacy AddInData records (written before recordType/schemaVersion
+   existed) are normalized on read so downstream code can rely on those
+   fields being present. Does not mutate the stored record. */
+
+function normalizeBooking(b: OpexBooking): OpexBooking {
+  if (b.recordType) return b;
+  return { ...b, recordType: "booking", schemaVersion: SCHEMA_VERSION };
+}
+
+function normalizeNotification(n: OpexNotification): OpexNotification {
+  if (n.recordType) return n;
+  return { ...n, recordType: "notification", schemaVersion: SCHEMA_VERSION };
+}
+
+function normalizeAudit(a: OpexBookingAudit): OpexBookingAudit {
+  if (a.recordType) return a;
+  return { ...a, recordType: "booking_audit", schemaVersion: SCHEMA_VERSION };
 }
 
 /*───────────────────── Conflict check helper ─────────────────────*/
@@ -209,6 +255,15 @@ export class AddInDataBookingDataProvider implements BookingDataProvider, Notifi
   private readonly addInId: string | null;
   private readonly groupId: string;
 
+  /*───────────────────── Simple TTL cache for read performance ─────────────────────*/
+  /* Master data (devices/users/groups) changes infrequently; cache with TTL.
+     Booking results are cached and invalidated on any write. */
+  private static readonly MASTER_DATA_TTL_MS = 5 * 60 * 1000; // 5 minutes
+  private static readonly BOOKING_CACHE_TTL_MS = 30 * 1000; // 30 seconds
+
+  private masterDataCache: { devices: RawMyGeotabDevice[]; users: RawMyGeotabUser[]; groups: RawMyGeotabGroup[]; ts: number } | null = null;
+  private bookingCache: { bookings: ResolvedBooking[]; ts: number } | null = null;
+
   constructor(api: GeotabApi | null, addInId: string | null, groupId: string = DEFAULT_GROUP_ID) {
     this.api = api;
     this.addInId = addInId;
@@ -218,6 +273,14 @@ export class AddInDataBookingDataProvider implements BookingDataProvider, Notifi
       hasAddInId: !!addInId,
       addInIdValid: addInId ? isValidAddInId(addInId) : false,
     });
+  }
+
+  private invalidateBookingCache(): void {
+    this.bookingCache = null;
+  }
+
+  private invalidateMasterDataCache(): void {
+    this.masterDataCache = null;
   }
 
   /*───────────────────── JSON-RPC wrapper over geotab.addin API ─────────────────────*/
@@ -287,14 +350,40 @@ export class AddInDataBookingDataProvider implements BookingDataProvider, Notifi
   /*───────────────────── Booking transactions (AddInData storage) ─────────────────────*/
 
   private async getDevicesRaw(): Promise<RawMyGeotabDevice[]> {
-    return this.apiCall<RawMyGeotabDevice[]>("Get", { typeName: "Device", resultsLimit: 1000 });
+    const now = Date.now();
+    if (this.masterDataCache && now - this.masterDataCache.ts < AddInDataBookingDataProvider.MASTER_DATA_TTL_MS) {
+      return this.masterDataCache.devices;
+    }
+    const devices = await this.apiCall<RawMyGeotabDevice[]>("Get", { typeName: "Device", resultsLimit: 1000 });
+    this.masterDataCache = { devices, users: this.masterDataCache?.users ?? [], groups: this.masterDataCache?.groups ?? [], ts: now };
+    return devices;
   }
 
   private async getUsersRaw(): Promise<RawMyGeotabUser[]> {
-    return this.apiCall<RawMyGeotabUser[]>("Get", { typeName: "User", resultsLimit: 1000 });
+    const now = Date.now();
+    if (this.masterDataCache && now - this.masterDataCache.ts < AddInDataBookingDataProvider.MASTER_DATA_TTL_MS) {
+      return this.masterDataCache.users;
+    }
+    const users = await this.apiCall<RawMyGeotabUser[]>("Get", { typeName: "User", resultsLimit: 1000 });
+    this.masterDataCache = { devices: this.masterDataCache?.devices ?? [], users, groups: this.masterDataCache?.groups ?? [], ts: now };
+    return users;
+  }
+
+  private async getGroupsRaw(): Promise<RawMyGeotabGroup[]> {
+    const now = Date.now();
+    if (this.masterDataCache && now - this.masterDataCache.ts < AddInDataBookingDataProvider.MASTER_DATA_TTL_MS) {
+      return this.masterDataCache.groups;
+    }
+    const groups = await this.apiCall<RawMyGeotabGroup[]>("Get", { typeName: "Group", resultsLimit: 1000 });
+    this.masterDataCache = { devices: this.masterDataCache?.devices ?? [], users: this.masterDataCache?.users ?? [], groups, ts: now };
+    return groups;
   }
 
   async getBookings(): Promise<ResolvedBooking[]> {
+    const now = Date.now();
+    if (this.bookingCache && now - this.bookingCache.ts < AddInDataBookingDataProvider.BOOKING_CACHE_TTL_MS) {
+      return this.bookingCache.bookings;
+    }
     const records = await this.apiCall<AddInDataRecord[]>("Get", {
       typeName: "AddInData",
       search: { addInId: this.addInId },
@@ -303,7 +392,9 @@ export class AddInDataBookingDataProvider implements BookingDataProvider, Notifi
     const users = await this.getUsersRaw();
     const deviceMap = new Map(devices.map(d => [d.id, d]));
     const userMap = new Map(users.map(u => [u.id, u]));
-    return (records || []).map(r => resolveAddInDataBooking(r, deviceMap, userMap));
+    const bookings = (records || []).map(r => resolveAddInDataBooking(r, deviceMap, userMap));
+    this.bookingCache = { bookings, ts: now };
+    return bookings;
   }
 
   async createBooking(input: {
@@ -333,8 +424,11 @@ export class AddInDataBookingDataProvider implements BookingDataProvider, Notifi
     }
 
     const now = new Date().toISOString();
+    const businessId = generateBusinessId();
     const booking: OpexBooking = {
-      id: `addin-${Date.now()}`,
+      recordType: "booking",
+      schemaVersion: SCHEMA_VERSION,
+      id: businessId,
       deviceId: input.deviceId,
       requesterUserId: input.requesterUserId,
       requestedClass: input.requestedClass,
@@ -363,6 +457,7 @@ export class AddInDataBookingDataProvider implements BookingDataProvider, Notifi
         groups: [{ id: this.groupId }],
       },
     });
+    this.invalidateBookingCache();
     if (response?.id) {
       booking.id = response.id;
     }
@@ -371,10 +466,13 @@ export class AddInDataBookingDataProvider implements BookingDataProvider, Notifi
     return resolved.find(b => b.id === booking.id) ?? resolveBookingToResolved(booking);
   }
 
-  async updateBookingStatus(id: string, status: string, approverId?: string, approvalRemarks?: string): Promise<void> {
+  async updateBookingStatus(id: string, status: string, expectedVersion: number, approverId?: string, approvalRemarks?: string): Promise<void> {
     const record = await this.findBookingRecord(id);
     if (!record) throw new Error(`BOOKING_NOT_FOUND: ${id}`);
     const booking = deserializeBooking(record.details);
+    if ((booking.version || 0) !== expectedVersion) {
+      throw new Error(`OPTIMISTIC_LOCK_CONFLICT: Booking ${id} version is ${booking.version || 0}, expected ${expectedVersion}. It may have been modified by another user.`);
+    }
     booking.status = status as OpexBooking["status"];
     if (approverId !== undefined) booking.approverId = approverId;
     if (approvalRemarks !== undefined) booking.approvalRemarks = approvalRemarks;
@@ -389,6 +487,7 @@ export class AddInDataBookingDataProvider implements BookingDataProvider, Notifi
         groups: [{ id: this.groupId }],
       },
     });
+    this.invalidateBookingCache();
   }
 
   /**
@@ -422,6 +521,7 @@ export class AddInDataBookingDataProvider implements BookingDataProvider, Notifi
       typeName: "AddInData",
       entity: { id: record.id },
     });
+    this.invalidateBookingCache();
   }
 
   async resetDemoData(): Promise<void> {
@@ -469,7 +569,9 @@ export class AddInDataBookingDataProvider implements BookingDataProvider, Notifi
 
     const now = new Date().toISOString();
     const notification: OpexNotification = {
-      id: `n-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+      recordType: "notification",
+      schemaVersion: SCHEMA_VERSION,
+      id: generateBusinessId(),
       eventId: input.eventId,
       idempotencyKey: input.idempotencyKey,
       type: input.type,
@@ -605,7 +707,9 @@ export class AddInDataBookingDataProvider implements BookingDataProvider, Notifi
   }): Promise<void> {
     const now = new Date().toISOString();
     const record: OpexBookingAudit = {
-      id: `audit-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+      recordType: "booking_audit",
+      schemaVersion: SCHEMA_VERSION,
+      id: generateBusinessId(),
       booking_id: input.booking_id,
       action: input.action,
       actor_user_id: input.actor_user_id,
@@ -634,6 +738,120 @@ export class AddInDataBookingDataProvider implements BookingDataProvider, Notifi
       .map(r => deserializeAudit(r.details))
       .filter(a => a.booking_id === bookingId)
       .sort((a, b) => new Date(b.created_at).getTime() - new Date(a.created_at).getTime());
+  }
+
+  async createAuditPending(input: Omit<OpexAuditPending, "id" | "schemaVersion" | "recordType" | "created_at" | "retry_count" | "next_retry_at">): Promise<OpexAuditPending> {
+    const now = new Date().toISOString();
+    const record: OpexAuditPending = {
+      recordType: "booking_audit",
+      schemaVersion: SCHEMA_VERSION,
+      id: generateBusinessId(),
+      booking_id: input.booking_id,
+      action: input.action,
+      actor_user_id: input.actor_user_id,
+      previous_status: input.previous_status,
+      new_status: input.new_status,
+      details: input.details,
+      created_at: now,
+      retry_count: 0,
+      max_retries: MAX_RETRIES,
+      last_error: null,
+      next_retry_at: nextRetryAt(0),
+    };
+    const detailsStr = serializeAuditPending(record);
+    await this.apiCall<{ id?: string }>("Add", {
+      typeName: "AddInData",
+      entity: {
+        addInId: this.addInId,
+        details: detailsStr,
+        groups: [{ id: AUDIT_PENDING_GROUP_ID }],
+      },
+    });
+    return record;
+  }
+
+  async getAuditPending(): Promise<OpexAuditPending[]> {
+    const records = await this.apiCall<AddInDataRecord[]>("Get", {
+      typeName: "AddInData",
+      search: { addInId: this.addInId },
+    });
+    return (records || [])
+      .map(r => deserializeAuditPending(r.details))
+      .filter(p => p.recordType === "booking_audit")
+      .sort((a, b) => {
+        const da = a.next_retry_at ? new Date(a.next_retry_at).getTime() : 0;
+        const db = b.next_retry_at ? new Date(b.next_retry_at).getTime() : 0;
+        return da - db;
+      });
+  }
+
+  async deleteAuditPending(id: string): Promise<void> {
+    const records = await this.apiCall<AddInDataRecord[]>("Get", {
+      typeName: "AddInData",
+      search: { addInId: this.addInId },
+    });
+    const record = (records || []).find(r => {
+      try {
+        return deserializeAuditPending(r.details).id === id;
+      } catch {
+        return false;
+      }
+    });
+    if (!record) return;
+    await this.apiCall<unknown>("Delete", {
+      typeName: "AddInData",
+      entity: {
+        addInId: this.addInId,
+        id: record.id,
+      },
+    });
+  }
+
+  async createAuditDeadLetter(input: Omit<OpexAuditDeadLetter, "id" | "schemaVersion" | "recordType" | "created_at" | "dead_lettered_at">): Promise<OpexAuditDeadLetter> {
+    const now = new Date().toISOString();
+    const record: OpexAuditDeadLetter = {
+      recordType: "audit_dead_letter",
+      schemaVersion: SCHEMA_VERSION,
+      id: generateBusinessId(),
+      booking_id: input.booking_id,
+      action: input.action,
+      actor_user_id: input.actor_user_id,
+      previous_status: input.previous_status,
+      new_status: input.new_status,
+      details: input.details,
+      created_at: now,
+      retry_count: input.retry_count,
+      max_retries: input.max_retries,
+      last_error: input.last_error,
+      next_retry_at: input.next_retry_at,
+      dead_lettered_at: now,
+      original_pending_id: input.original_pending_id,
+    };
+    const detailsStr = serializeAuditDeadLetter(record);
+    await this.apiCall<{ id?: string }>("Add", {
+      typeName: "AddInData",
+      entity: {
+        addInId: this.addInId,
+        details: detailsStr,
+        groups: [{ id: AUDIT_DEAD_LETTER_GROUP_ID }],
+      },
+    });
+    return record;
+  }
+
+  async getAuditDeadLetters(): Promise<OpexAuditDeadLetter[]> {
+    const records = await this.apiCall<AddInDataRecord[]>("Get", {
+      typeName: "AddInData",
+      search: { addInId: this.addInId },
+    });
+    return (records || [])
+      .map(r => deserializeAuditDeadLetter(r.details))
+      .filter(d => d.recordType === "audit_dead_letter")
+      .sort((a, b) => {
+        const da = a.dead_lettered_at ? new Date(a.dead_lettered_at).getTime() : 0;
+        const db = b.dead_lettered_at ? new Date(b.dead_lettered_at).getTime() : 0;
+        return db - da;
+      });
   }
 
   isLive(): boolean {
@@ -678,6 +896,8 @@ function resolveAddInDataBooking(
     booking = deserializeBooking(record.details);
   } catch {
     booking = {
+      recordType: "booking",
+      schemaVersion: SCHEMA_VERSION,
       id: record.id,
       deviceId: "",
       requesterUserId: "",
@@ -709,6 +929,8 @@ function resolveAddInDataBooking(
     end_at: booking.endAt ?? "",
   });
   return {
+    recordType: booking.recordType,
+    schemaVersion: booking.schemaVersion,
     id: booking.id ?? record.id,
     requester_id: booking.requesterUserId ?? "",
     requester_name: requester?.name ?? "Unknown User",
@@ -745,6 +967,8 @@ function resolveBookingToResolved(booking: OpexBooking): ResolvedBooking {
     end_at: booking.endAt,
   });
   return {
+    recordType: booking.recordType,
+    schemaVersion: booking.schemaVersion,
     id: booking.id,
     requester_id: booking.requesterUserId,
     requester_name: "Unknown User",

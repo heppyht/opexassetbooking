@@ -62,7 +62,7 @@ test("workflow: approve/reject/assign/complete/cancel transitions with single au
 
   let b = await p.createBooking(createInput());
   let prev = snapshotBooking(b);
-  await p.updateBookingStatus(b.id, "APPROVED", demoActor);
+  await p.updateBookingStatus(b.id, "APPROVED", b.version, demoActor);
   let updated = (await p.getBookings()).find(x => x.id === b.id);
   assert.equal(updated.status, "APPROVED");
   let r = await emitAuditEvent({ mode: "DEMO", provider: p, entityId: b.id, action: "BOOKING_APPROVED", actorUserId: demoActor, previousStatus: prev.status, newStatus: "APPROVED", previous: prev, next: snapshotBooking(updated), idempotencyKey: `DEMO:${b.id}:APPROVED` });
@@ -73,7 +73,7 @@ test("workflow: approve/reject/assign/complete/cancel transitions with single au
 
   b = await p.createBooking(createInput());
   prev = snapshotBooking(b);
-  await p.updateBookingStatus(b.id, "REJECTED", livePrincipal, "No vehicle");
+  await p.updateBookingStatus(b.id, "REJECTED", b.version, livePrincipal, "No vehicle");
   updated = (await p.getBookings()).find(x => x.id === b.id);
   assert.equal(updated.status, "REJECTED");
   r = await emitAuditEvent({ mode: "ADDIN_DATA", provider: p, entityId: b.id, action: "BOOKING_REJECTED", actorUserId: livePrincipal, previousStatus: prev.status, newStatus: "REJECTED", previous: prev, next: snapshotBooking(updated), metadata: { reason: "No vehicle" }, idempotencyKey: `LIVE:${b.id}:REJECTED` });
@@ -86,9 +86,9 @@ test("workflow: approve/reject/assign/complete/cancel transitions with single au
   assert.equal(JSON.parse(rej.details).metadata.reason, "No vehicle");
 
   b = await p.createBooking(createInput());
-  await p.updateBookingStatus(b.id, "APPROVED", demoActor);
+  await p.updateBookingStatus(b.id, "APPROVED", b.version, demoActor);
   prev = snapshotBooking((await p.getBookings()).find(x => x.id === b.id));
-  await p.updateBookingStatus(b.id, "ASSIGNED", demoActor);
+  await p.updateBookingStatus(b.id, "ASSIGNED", b.version + 1, demoActor);
   updated = (await p.getBookings()).find(x => x.id === b.id);
   assert.equal(updated.status, "ASSIGNED");
   r = await emitAuditEvent({ mode: "DEMO", provider: p, entityId: b.id, action: "VEHICLE_ASSIGNED", actorUserId: demoActor, previousStatus: prev.status, newStatus: "ASSIGNED", previous: prev, next: snapshotBooking(updated), idempotencyKey: `DEMO:${b.id}:ASSIGNED` });
@@ -96,7 +96,7 @@ test("workflow: approve/reject/assign/complete/cancel transitions with single au
   assert.equal((await p.getAuditRecords(b.id)).filter(a => a.action === "VEHICLE_ASSIGNED").length, 1);
 
   prev = snapshotBooking(updated);
-  await p.updateBookingStatus(b.id, "COMPLETED", demoActor);
+  await p.updateBookingStatus(b.id, "COMPLETED", b.version + 2, demoActor);
   updated = (await p.getBookings()).find(x => x.id === b.id);
   assert.equal(updated.status, "COMPLETED");
   r = await emitAuditEvent({ mode: "DEMO", provider: p, entityId: b.id, action: "BOOKING_COMPLETED", actorUserId: demoActor, previousStatus: prev.status, newStatus: "COMPLETED", previous: prev, next: snapshotBooking(updated), idempotencyKey: `DEMO:${b.id}:COMPLETED` });
@@ -105,7 +105,7 @@ test("workflow: approve/reject/assign/complete/cancel transitions with single au
 
   b = await p.createBooking(createInput());
   prev = snapshotBooking(b);
-  await p.updateBookingStatus(b.id, "CANCELLED", demoActor);
+  await p.updateBookingStatus(b.id, "CANCELLED", b.version, demoActor);
   updated = (await p.getBookings()).find(x => x.id === b.id);
   assert.equal(updated.status, "CANCELLED");
   r = await emitAuditEvent({ mode: "DEMO", provider: p, entityId: b.id, action: "BOOKING_CANCELLED", actorUserId: demoActor, previousStatus: prev.status, newStatus: "CANCELLED", previous: prev, next: snapshotBooking(updated), idempotencyKey: `DEMO:${b.id}:CANCELLED` });

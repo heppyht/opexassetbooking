@@ -14,8 +14,11 @@ import type {
   NotificationDataProvider,
   OpexNotification,
   OpexBookingAudit,
+  OpexAuditPending,
+  OpexAuditDeadLetter,
   NotificationType,
 } from "./types";
+import { SCHEMA_VERSION, generateBusinessId } from "./types.ts";
 import {
   mockMyGeotabDevices,
   mockMyGeotabUsers,
@@ -26,10 +29,11 @@ import {
 } from "./mockMyGeotab.ts";
 import { validateResolvedBooking } from "./bookingValidation.ts";
 
-const STORAGE_KEY = "opex-vbm-demo-bookings";
-const RESET_KEY = "opex-vbm-demo-reset";
-const NOTIFICATION_STORAGE_KEY = "opex-vbm-demo-notifications";
-const AUDIT_STORAGE_KEY = "opex-vbm-demo-audit";
+const MAX_RETRIES = 5;
+
+function nextRetryAt(retryCount: number): string {
+  return new Date(Date.now() + Math.min(1000 * 2 ** retryCount, 30000)).toISOString();
+}
 
 function overlaps(aStart: Date, aEnd: Date, bStart: Date, bEnd: Date): boolean {
   return aStart < bEnd && bStart < aEnd;
@@ -97,6 +101,8 @@ function resolveBooking(
   });
 
   return {
+    recordType: booking.recordType,
+    schemaVersion: booking.schemaVersion,
     id: booking.id,
     requester_id: booking.requesterUserId,
     requester_name: requester?.name ?? "Unknown User",
@@ -134,6 +140,8 @@ export class LocalBookingDataProvider implements BookingDataProvider, Notificati
   private bookings: OpexBooking[];
   private notifications: OpexNotification[];
   private auditRecords: OpexBookingAudit[];
+  private pendingAuditRecords: OpexAuditPending[];
+  private deadLetterRecords: OpexAuditDeadLetter[];
 
   constructor() {
     this.devices = [...mockMyGeotabDevices];
@@ -141,70 +149,11 @@ export class LocalBookingDataProvider implements BookingDataProvider, Notificati
     this.groups = [...mockMyGeotabGroups];
     this.statusData = [...mockMyGeotabStatusData];
     this.logRecords = [...mockMyGeotabLogRecords];
-    this.bookings = this.loadBookingsFromStorage();
-    this.notifications = this.loadNotificationsFromStorage();
-    this.auditRecords = this.loadAuditRecordsFromStorage();
-  }
-
-  /*â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€ localStorage persistence â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€*/
-  private loadBookingsFromStorage(): OpexBooking[] {
-    try {
-      const raw = localStorage.getItem(STORAGE_KEY);
-      if (!raw) return [...mockOpexBookings];
-      const parsed = JSON.parse(raw) as OpexBooking[];
-      if (!Array.isArray(parsed) || parsed.length === 0) return [...mockOpexBookings];
-      return parsed;
-    } catch {
-      return [...mockOpexBookings];
-    }
-  }
-
-  private saveBookingsToStorage(): void {
-    try {
-      localStorage.setItem(STORAGE_KEY, JSON.stringify(this.bookings));
-    } catch {
-      // localStorage may be unavailable in some environments
-    }
-  }
-
-  private loadNotificationsFromStorage(): OpexNotification[] {
-    try {
-      const raw = localStorage.getItem(NOTIFICATION_STORAGE_KEY);
-      if (!raw) return [];
-      const parsed = JSON.parse(raw) as OpexNotification[];
-      if (!Array.isArray(parsed)) return [];
-      return parsed;
-    } catch {
-      return [];
-    }
-  }
-
-  private saveNotificationsToStorage(): void {
-    try {
-      localStorage.setItem(NOTIFICATION_STORAGE_KEY, JSON.stringify(this.notifications));
-    } catch {
-      // localStorage may be unavailable
-    }
-  }
-
-  private loadAuditRecordsFromStorage(): OpexBookingAudit[] {
-    try {
-      const raw = localStorage.getItem(AUDIT_STORAGE_KEY);
-      if (!raw) return [];
-      const parsed = JSON.parse(raw) as OpexBookingAudit[];
-      if (!Array.isArray(parsed)) return [];
-      return parsed;
-    } catch {
-      return [];
-    }
-  }
-
-  private saveAuditRecordsToStorage(): void {
-    try {
-      localStorage.setItem(AUDIT_STORAGE_KEY, JSON.stringify(this.auditRecords));
-    } catch {
-      // localStorage may be unavailable
-    }
+    this.bookings = [...mockOpexBookings];
+    this.notifications = [];
+    this.auditRecords = [];
+    this.pendingAuditRecords = [];
+    this.deadLetterRecords = [];
   }
 
   /*â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€ Master data â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€*/
@@ -247,10 +196,12 @@ export class LocalBookingDataProvider implements BookingDataProvider, Notificati
     driverId?: string | null;
     driverName?: string | null;
   }): Promise<ResolvedBooking> {
-    const newId = `b${Date.now()}`;
+    const newId = generateBusinessId();
     const now = new Date().toISOString();
 
     const booking: OpexBooking = {
+      recordType: "booking",
+      schemaVersion: SCHEMA_VERSION,
       id: newId,
       deviceId: input.deviceId,
       requesterUserId: input.requesterUserId,
@@ -272,16 +223,18 @@ export class LocalBookingDataProvider implements BookingDataProvider, Notificati
     };
 
     this.bookings.push(booking);
-    this.saveBookingsToStorage();
 
     const deviceMap = new Map(this.devices.map(d => [d.id, d]));
     const userMap = new Map(this.users.map(u => [u.id, u]));
     return resolveBooking(booking, deviceMap, userMap);
   }
 
-  async updateBookingStatus(id: string, status: string, approverId?: string, approvalRemarks?: string): Promise<void> {
+  async updateBookingStatus(id: string, status: string, expectedVersion: number, approverId?: string, approvalRemarks?: string): Promise<void> {
     const idx = this.bookings.findIndex(b => b.id === id);
     if (idx === -1) throw new Error(`BOOKING_NOT_FOUND: ${id}`);
+    if (this.bookings[idx].version !== expectedVersion) {
+      throw new Error(`OPTIMISTIC_LOCK_CONFLICT: Booking ${id} version is ${this.bookings[idx].version}, expected ${expectedVersion}. It may have been modified by another user.`);
+    }
     this.bookings[idx] = {
       ...this.bookings[idx],
       status: status as OpexBooking["status"],
@@ -290,23 +243,19 @@ export class LocalBookingDataProvider implements BookingDataProvider, Notificati
       updatedAt: new Date().toISOString(),
       version: this.bookings[idx].version + 1,
     };
-    this.saveBookingsToStorage();
   }
 
   async deleteBooking(id: string): Promise<void> {
     const idx = this.bookings.findIndex(b => b.id === id);
     if (idx === -1) throw new Error(`BOOKING_NOT_FOUND: ${id}`);
     this.bookings.splice(idx, 1);
-    this.saveBookingsToStorage();
   }
 
   async resetDemoData(): Promise<void> {
     this.bookings = [...mockOpexBookings];
     this.notifications = [];
     this.auditRecords = [];
-    this.saveBookingsToStorage();
-    this.saveNotificationsToStorage();
-    this.saveAuditRecordsToStorage();
+    this.pendingAuditRecords = [];
   }
 
   /*â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€ Notification operations â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€*/
@@ -340,7 +289,9 @@ export class LocalBookingDataProvider implements BookingDataProvider, Notificati
 
     const now = new Date().toISOString();
     const notification: OpexNotification = {
-      id: `n-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+      recordType: "notification",
+      schemaVersion: SCHEMA_VERSION,
+      id: generateBusinessId(),
       eventId: input.eventId,
       idempotencyKey: input.idempotencyKey,
       type: input.type,
@@ -355,7 +306,6 @@ export class LocalBookingDataProvider implements BookingDataProvider, Notificati
       updated_at: now,
     };
     this.notifications.push(notification);
-    this.saveNotificationsToStorage();
     return notification;
   }
 
@@ -368,7 +318,6 @@ export class LocalBookingDataProvider implements BookingDataProvider, Notificati
     const idx = this.notifications.findIndex(n => n.id === notificationId);
     if (idx === -1) return;
     this.notifications[idx] = { ...this.notifications[idx], is_read: true, updated_at: new Date().toISOString() };
-    this.saveNotificationsToStorage();
   }
 
   async markAllAsRead(userId: string): Promise<void> {
@@ -378,7 +327,6 @@ export class LocalBookingDataProvider implements BookingDataProvider, Notificati
         ? { ...n, is_read: true, updated_at: now }
         : n
     );
-    this.saveNotificationsToStorage();
   }
 
   async markDeliveryStatus(notificationId: string, status: "pending" | "delivered" | "failed"): Promise<void> {
@@ -390,7 +338,6 @@ export class LocalBookingDataProvider implements BookingDataProvider, Notificati
       delivered_at: status === "delivered" ? new Date().toISOString() : this.notifications[idx].delivered_at,
       updated_at: new Date().toISOString(),
     };
-    this.saveNotificationsToStorage();
   }
 
   /*â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€ Audit operations â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€*/
@@ -404,7 +351,9 @@ export class LocalBookingDataProvider implements BookingDataProvider, Notificati
   }): Promise<void> {
     const now = new Date().toISOString();
     const record: OpexBookingAudit = {
-      id: `audit-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+      recordType: "booking_audit",
+      schemaVersion: SCHEMA_VERSION,
+      id: generateBusinessId(),
       booking_id: input.booking_id,
       action: input.action,
       actor_user_id: input.actor_user_id,
@@ -414,13 +363,80 @@ export class LocalBookingDataProvider implements BookingDataProvider, Notificati
       created_at: now,
     };
     this.auditRecords.push(record);
-    this.saveAuditRecordsToStorage();
   }
 
   async getAuditRecords(bookingId: string): Promise<OpexBookingAudit[]> {
     return this.auditRecords
       .filter(r => r.booking_id === bookingId)
       .sort((a, b) => new Date(b.created_at).getTime() - new Date(a.created_at).getTime());
+  }
+
+  async createAuditPending(input: Omit<OpexAuditPending, "id" | "schemaVersion" | "recordType" | "created_at" | "retry_count" | "next_retry_at">): Promise<OpexAuditPending> {
+    const now = new Date().toISOString();
+    const record: OpexAuditPending = {
+      recordType: "booking_audit",
+      schemaVersion: SCHEMA_VERSION,
+      id: generateBusinessId(),
+      booking_id: input.booking_id,
+      action: input.action,
+      actor_user_id: input.actor_user_id,
+      previous_status: input.previous_status,
+      new_status: input.new_status,
+      details: input.details,
+      created_at: now,
+      retry_count: 0,
+      max_retries: MAX_RETRIES,
+      last_error: null,
+      next_retry_at: nextRetryAt(0),
+    };
+    this.pendingAuditRecords.push(record);
+    return record;
+  }
+
+  async getAuditPending(): Promise<OpexAuditPending[]> {
+    return [...this.pendingAuditRecords]
+      .sort((a, b) => {
+        const da = a.next_retry_at ? new Date(a.next_retry_at).getTime() : 0;
+        const db = b.next_retry_at ? new Date(b.next_retry_at).getTime() : 0;
+        return da - db;
+      });
+  }
+
+  async deleteAuditPending(id: string): Promise<void> {
+    this.pendingAuditRecords = this.pendingAuditRecords.filter(p => p.id !== id);
+  }
+
+  async createAuditDeadLetter(input: Omit<OpexAuditDeadLetter, "id" | "schemaVersion" | "recordType" | "created_at" | "dead_lettered_at">): Promise<OpexAuditDeadLetter> {
+    const now = new Date().toISOString();
+    const record: OpexAuditDeadLetter = {
+      recordType: "audit_dead_letter",
+      schemaVersion: SCHEMA_VERSION,
+      id: generateBusinessId(),
+      booking_id: input.booking_id,
+      action: input.action,
+      actor_user_id: input.actor_user_id,
+      previous_status: input.previous_status,
+      new_status: input.new_status,
+      details: input.details,
+      created_at: now,
+      retry_count: input.retry_count,
+      max_retries: input.max_retries,
+      last_error: input.last_error,
+      next_retry_at: input.next_retry_at,
+      dead_lettered_at: now,
+      original_pending_id: input.original_pending_id,
+    };
+    this.deadLetterRecords.push(record);
+    return record;
+  }
+
+  async getAuditDeadLetters(): Promise<OpexAuditDeadLetter[]> {
+    return [...this.deadLetterRecords]
+      .sort((a, b) => {
+        const da = a.dead_lettered_at ? new Date(a.dead_lettered_at).getTime() : 0;
+        const db = b.dead_lettered_at ? new Date(b.dead_lettered_at).getTime() : 0;
+        return db - da;
+      });
   }
 
   isLive(): boolean {

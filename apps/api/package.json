@@ -10,8 +10,7 @@
     "test": "node --experimental-strip-types --test test/*.test.mjs"
   },
   "dependencies": {
-    "hono": "^4.6.12",
-    "postgres": "^3.4.5"
+    "hono": "^4.6.12"
   },
   "devDependencies": {
     "@cloudflare/workers-types": "^4.20241127.0",

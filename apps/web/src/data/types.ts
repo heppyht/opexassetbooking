@@ -1,6 +1,10 @@
 /*───────────────────── MyGeotab-Aligned Types ─────────────────────*/
 
-import type { GeotabDevice, GeotabUser, GeotabTrip, GeotabLocation } from "../../../api/src/integrations/mygeotab/types";
+/* Local MyGeotab type definitions (no dependency on external API backend). */
+export type GeotabDevice = { id: string; name?: string; serialNumber?: string };
+export type GeotabUser = { id: string; name?: string; firstName?: string; lastName?: string };
+export type GeotabTrip = { id?: string; device?: { id: string }; start?: string; stop?: string };
+export type GeotabLocation = { device?: { id: string }; dateTime?: string; latitude?: number; longitude?: number };
 
 /*───────────────────── Groups ─────────────────────*/
 export interface MyGeotabGroup {
@@ -60,8 +64,34 @@ export interface BookingValidationResult {
   issues: string[];
 }
 
+/*───────────────────── Record type discriminator ─────────────────────*/
+/* Discriminates the logical entity kind stored in a single AddInData
+   entity store. Every persistent record carries recordType and
+   schemaVersion so the client can normalize legacy records and evolve
+   the schema without server-side migrations. */
+export type RecordType = "booking" | "booking_audit" | "notification" | "vehicle_hold" | "audit_dead_letter" | "reconciliation_finding";
+
+export const SCHEMA_VERSION = 1;
+
+/* Stable business identifier generator. Produces a UUID v4 string used
+   as the logical business id (details.id), distinct from the MyGeotab
+   AddInData server record id (record.id). */
+export function generateBusinessId(): string {
+  if (typeof crypto !== "undefined" && typeof crypto.randomUUID === "function") {
+    return crypto.randomUUID();
+  }
+  /* Fallback for environments without crypto.randomUUID. */
+  return "xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx".replace(/[xy]/g, c => {
+    const r = (Math.random() * 16) | 0;
+    const v = c === "x" ? r : (r & 0x3) | 0x8;
+    return v.toString(16);
+  });
+}
+
 /*───────────────────── OPEX Booking (MyGeotab-aligned) ─────────────────────*/
 export interface OpexBooking {
+  recordType: RecordType;
+  schemaVersion: number;
   id: string;
   deviceId: string;
   requesterUserId: string;
@@ -95,6 +125,20 @@ export interface OpexBooking {
   version: number;
 }
 
+/*───────────────────── Vehicle hold (MyGeotab-aligned) ─────────────────────*/
+export interface OpexVehicleHold {
+  recordType: RecordType;
+  schemaVersion: number;
+  id: string;
+  vehicleId: string;
+  startAt: string;
+  endAt: string;
+  reason: string;
+  status: "ACTIVE" | "CANCELLED";
+  createdBy: string | null;
+  createdAt: string;
+}
+
 /*───────────────────── Frontend-view types (resolved through master data) ─────────────────────*/
 export interface ResolvedAsset {
   id: string;
@@ -109,6 +153,8 @@ export interface ResolvedAsset {
 }
 
 export interface ResolvedBooking {
+  recordType: RecordType;
+  schemaVersion: number;
   id: string;
   requester_id: string;
   requester_name: string;
@@ -162,7 +208,7 @@ export interface BookingDataProvider {
     driverId?: string | null;
     driverName?: string | null;
   }): Promise<ResolvedBooking>;
-  updateBookingStatus(id: string, status: string, approverId?: string, approvalRemarks?: string): Promise<void>;
+  updateBookingStatus(id: string, status: string, expectedVersion: number, approverId?: string, approvalRemarks?: string): Promise<void>;
   deleteBooking(id: string): Promise<void>;
   resetDemoData(): Promise<void>;
   isLive(): boolean;
@@ -179,6 +225,8 @@ export type NotificationType =
   | "booking_cancelled";
 
 export interface OpexNotification {
+  recordType: RecordType;
+  schemaVersion: number;
   id: string;
   eventId: string;
   idempotencyKey: string;
@@ -195,6 +243,8 @@ export interface OpexNotification {
 }
 
 export interface OpexBookingAudit {
+  recordType: RecordType;
+  schemaVersion: number;
   id: string;
   booking_id: string;
   action: string;
@@ -203,6 +253,118 @@ export interface OpexBookingAudit {
   new_status: string | null;
   details: string | null;
   created_at: string;
+}
+
+/*───────────────────── Audit pending queue (retry/recovery) ─────────────────────*/
+/* Audit records that failed to write to AddInData are stored here as pending
+   records with recordType "booking_audit". A recovery process retries them
+   with exponential backoff until they succeed or reach max attempts. */
+export interface OpexAuditPending {
+  recordType: RecordType;
+  schemaVersion: number;
+  id: string;
+  booking_id: string;
+  action: string;
+  actor_user_id: string;
+  previous_status: string | null;
+  new_status: string | null;
+  details: string | null;
+  created_at: string;
+  retry_count: number;
+  max_retries: number;
+  last_error: string | null;
+  next_retry_at: string | null;
+}
+
+/*───────────────────── Audit dead letter (exhausted retries) ─────────────────────*/
+/* Audit records that exceed max_retries are moved to dead-letter state instead
+   of being deleted. This preserves the original event, error, and retry metadata
+   for later inspection and manual recovery. */
+export interface OpexAuditDeadLetter {
+  recordType: RecordType;
+  schemaVersion: number;
+  id: string;
+  booking_id: string;
+  action: string;
+  actor_user_id: string;
+  previous_status: string | null;
+  new_status: string | null;
+  details: string | null;
+  created_at: string;
+  retry_count: number;
+  max_retries: number;
+  last_error: string | null;
+  next_retry_at: string | null;
+  dead_lettered_at: string;
+  original_pending_id: string;
+}
+
+/*───────────────────── Audit reconciliation ─────────────────────*/
+/* Result of reconciling bookings against audit records to find
+   bookings that are missing expected audit events. */
+export interface AuditReconciliationResult {
+  booking_id: string;
+  booking_status: string;
+  missing_audit_actions: string[];
+  last_audit_action: string | null;
+  last_audit_timestamp: string | null;
+}
+
+/*───────────────────── Reconciliation Finding Types ─────────────────────*/
+/* Classification of reconciliation findings. Distinguishes between
+   legitimate partial writes, interrupted application operations,
+   potential unauthorized direct writes, and insufficient evidence. */
+export type ReconciliationFindingType =
+  | "MISSING_AUDIT_EVENT"
+  | "UNEXPECTED_STATUS_TRANSITION"
+  | "INVALID_ACTOR_ATTRIBUTION"
+  | "VERSION_MISMATCH"
+  | "DUPLICATE_BOOKING_RECORD"
+  | "RECORD_MODIFIED_WITHOUT_AUDIT"
+  | "RECORD_DELETED_WITHOUT_AUDIT"
+  | "NOTIFICATION_MANIPULATION"
+  | "INCONSISTENT_BOOKING_STATE"
+  | "INSUFFICIENT_EVIDENCE";
+
+export type ReconciliationSeverity = "LOW" | "MEDIUM" | "HIGH" | "CRITICAL";
+
+export type ReconciliationStatus = "OPEN" | "INVESTIGATING" | "RESOLVED" | "FALSE_POSITIVE";
+
+/* A structured reconciliation finding. Stored in AddInData as recordType
+   "reconciliation_finding" and exposed through the security monitoring
+   dashboard. Original audit evidence is never overwritten. */
+export interface OpexReconciliationFinding {
+  recordType: RecordType;
+  schemaVersion: number;
+  id: string;
+  finding_id: string;
+  booking_id: string;
+  finding_type: ReconciliationFindingType;
+  severity: ReconciliationSeverity;
+  expected_state: string | null;
+  observed_state: string | null;
+  detection_timestamp: string;
+  related_audit_references: string[];
+  reconciliation_status: ReconciliationStatus;
+  evidence_classification: "LEGITIMATE_PARTIAL_WRITE" | "INTERRUPTED_OPERATION" | "POTENTIAL_UNAUTHORIZED_WRITE" | "INSUFFICIENT_EVIDENCE";
+  notes: string | null;
+}
+
+/*───────────────────── Reconciliation State (Service Add-In) ─────────────────────*/
+/* Tracks reconciliation run state for the Service Add-In. Stored in
+   localStorage to prevent overlapping runs within the same instance.
+   NOTE: localStorage does not provide atomic distributed locking — it is
+   a best-effort, single-origin mechanism shared across tabs. */
+export interface ReconciliationRunState {
+  last_successful_reconciliation: string | null;
+  last_error: string | null;
+  last_error_timestamp: string | null;
+  last_run_timestamp: string | null;
+  reconciliation_in_progress: boolean;
+  total_findings: number;
+  open_findings: number;
+  lock_owner: string | null;
+  lock_acquired_at: string | null;
 }
 
 /*───────────────────── Notification Provider Interface ─────────────────────*/
@@ -232,5 +394,10 @@ export interface NotificationDataProvider {
     details: string | null;
   }): Promise<void>;
   getAuditRecords(bookingId: string): Promise<OpexBookingAudit[]>;
+  createAuditPending(input: Omit<OpexAuditPending, "id" | "schemaVersion" | "recordType" | "created_at" | "retry_count" | "next_retry_at" | "max_retries" | "last_error">): Promise<OpexAuditPending>;
+  getAuditPending(): Promise<OpexAuditPending[]>;
+  deleteAuditPending(id: string): Promise<void>;
+  createAuditDeadLetter(input: Omit<OpexAuditDeadLetter, "id" | "schemaVersion" | "recordType" | "created_at" | "dead_lettered_at">): Promise<OpexAuditDeadLetter>;
+  getAuditDeadLetters(): Promise<OpexAuditDeadLetter[]>;
   isLive(): boolean;
 }

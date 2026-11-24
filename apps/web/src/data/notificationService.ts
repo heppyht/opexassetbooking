@@ -14,6 +14,7 @@ import type {
   ResolvedUser,
   NotificationType,
 } from "./types";
+import { generateBusinessId } from "./types.ts";
 
 /*───────────────────── Notification Event Types ─────────────────────*/
 
@@ -133,7 +134,7 @@ export class NotificationEngine {
       }
 
       await this.notifProvider.createNotification({
-        eventId: `evt-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+        eventId: generateBusinessId(),
         idempotencyKey: key,
         type: "booking_created",
         recipient_user_id: approver.id,
@@ -164,7 +165,7 @@ export class NotificationEngine {
     if (existing) return;
 
     await this.notifProvider.createNotification({
-      eventId: `evt-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+      eventId: generateBusinessId(),
       idempotencyKey: key,
       type: "booking_approved",
       recipient_user_id: booking.requester_id,
@@ -190,7 +191,7 @@ export class NotificationEngine {
     if (existing) return;
 
     await this.notifProvider.createNotification({
-      eventId: `evt-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+      eventId: generateBusinessId(),
       idempotencyKey: key,
       type: "booking_rejected",
       recipient_user_id: booking.requester_id,
@@ -216,7 +217,7 @@ export class NotificationEngine {
     if (existing) return;
 
     await this.notifProvider.createNotification({
-      eventId: `evt-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+      eventId: generateBusinessId(),
       idempotencyKey: key,
       type: "vehicle_assigned",
       recipient_user_id: booking.requester_id,
@@ -242,7 +243,7 @@ export class NotificationEngine {
     if (existing) return;
 
     await this.notifProvider.createNotification({
-      eventId: `evt-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+      eventId: generateBusinessId(),
       idempotencyKey: key,
       type: "booking_cancelled",
       recipient_user_id: booking.requester_id,
