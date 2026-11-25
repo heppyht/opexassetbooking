@@ -17,14 +17,22 @@ import type {
   NotificationDataProvider,
   OpexNotification,
   OpexBookingAudit,
+  OpexBookingAuditV2,
   OpexAuditPending,
   OpexAuditDeadLetter,
   NotificationType,
   RecordType,
+  CanonicalAuditInput,
+  NormalizedAuditEvent,
 } from "./types";
 import { SCHEMA_VERSION, generateBusinessId } from "./types.ts";
 import { isValidAddInId } from "../config/addinId.ts";
 import { validateResolvedBooking } from "./bookingValidation.ts";
+import { buildBookingAuditEvent, deserializeBookingAudit, generateCanonicalAuditKey, normalizeAuditRecord } from "./auditEvent.ts";
+import { RequestCache } from "./requestCache.ts";
+import { executeMultiGet, type MultiGetRequest } from "./multiCall.ts";
+import type { ServerAuthzClient } from "../auth/serverAuthzClient";
+import type { ServerAuthzSessionCreds } from "../auth/serverAuthzClient";
 
 /*───────────────────── Geotab API type (Add-In context) ─────────────────────*/
 
@@ -36,6 +44,35 @@ type GeotabApi = {
 const MAX_DETAILS_CHARS = 10000;
 const DEFAULT_GROUP_ID = "GroupCompanyId";
 const MAX_RETRIES = 5;
+
+/*───────────────────── Canonical status → Worker action contract ─────────────────────*/
+/* The Cloudflare Worker's ACTION_REQUIRED_ROLE (apps/api/src/authz.ts) is the
+   single source of truth for protected action names. The frontend MUST send
+   these exact literals to /authz/execute; any other string is rejected by the
+   Worker with UNKNOWN_ACTION (403). This map translates a target booking status
+   into the canonical action. Unknown statuses fail closed (no write). */
+const STATUS_TO_ACTION: Record<string, string> = {
+  APPROVED: "approve_booking",
+  REJECTED: "reject_booking",
+  CANCELLED: "cancel_booking",
+  COMPLETED: "complete_booking",
+  ASSIGNED: "assign_driver",
+};
+
+/*───────────────────── Query bounds & cache TTLs ─────────────────────*/
+/* Explicit, bounded result limits prevent unbounded AddInData reads.
+   Master data is cached longer (rarely changes); AddInData query results use
+   a short TTL and are invalidated after any write.
+   AddInData does not support server pagination, so resultsLimit is a safety
+   ceiling (not a page size) that bounds worst-case payload/memory. */
+const MASTER_DATA_LIMIT = 1000;
+const MASTER_DATA_TTL_MS = 5 * 60 * 1000; // 5 minutes
+const RECORDS_CACHE_TTL_MS = 10 * 1000; // 10 seconds
+const ADDIN_DATA_QUERY_LIMIT = 2000;
+const BOOKING_QUERY_LIMIT = 1000;
+const NOTIFICATION_QUERY_LIMIT = 1000;
+const AUDIT_QUERY_LIMIT = 500;
+const DEAD_LETTER_QUERY_LIMIT = 500;
 
 function nextRetryAt(retryCount: number): string {
   return new Date(Date.now() + Math.min(1000 * 2 ** retryCount, 30000)).toISOString();
@@ -70,6 +107,12 @@ function assertDetailsWithinLimit(value: unknown): void {
 
 function toDetailsObject<T extends object>(details: AddInDataDetails): T {
   return (typeof details === "string" ? JSON.parse(details) : details) as T;
+}
+
+function safeParse(value: unknown): Record<string, unknown> | undefined {
+  if (typeof value === "string") return JSON.parse(value);
+  if (value && typeof value === "object") return value as Record<string, unknown>;
+  return undefined;
 }
 
 function serializeNotification(n: OpexNotification): OpexNotification {
@@ -217,7 +260,6 @@ function serializeBooking(booking: OpexBooking): OpexBooking {
   assertDetailsWithinLimit(booking);
   return booking;
 }
-
 function deserializeBooking(details: AddInDataDetails): OpexBooking {
   return normalizeBooking(toDetailsObject<OpexBooking>(details));
 }
@@ -248,39 +290,220 @@ function overlaps(aStart: Date, aEnd: Date, bStart: Date, bEnd: Date): boolean {
   return aStart < bEnd && bStart < aEnd;
 }
 
+/*───────────────────── Classify record type ─────────────────────*/
+/* Classify a raw AddInData record's logical type. Prefers an explicit
+   details.recordType; for legacy records that predate recordType it infers the
+   type from the record's shape so existing data remains visible. Returns
+   undefined when the type cannot be determined (e.g., malformed details). */
+export function classifyRecordType(details: AddInDataDetails | undefined): RecordType | undefined {
+  const obj = safeParse(details ?? undefined);
+  if (!obj || typeof obj !== "object") return undefined;
+  const rt = obj.recordType;
+  if (
+    rt === "booking" ||
+    rt === "booking_audit" ||
+    rt === "bookingAudit" ||
+    rt === "notification" ||
+    rt === "audit_dead_letter" ||
+    rt === "reconciliation_finding" ||
+    rt === "vehicle_hold"
+  ) {
+    return rt;
+  }
+  /* Legacy inference (no explicit recordType) — by structural shape. */
+  if ("dead_lettered_at" in obj) return "audit_dead_letter";
+  if ("recipient_user_id" in obj) return "notification";
+  if ("retry_count" in obj && "next_retry_at" in obj) return "booking_audit";
+  if ("deviceId" in obj || "requesterUserId" in obj) return "booking";
+  if ("booking_id" in obj && "action" in obj && "actor_user_id" in obj) return "booking_audit";
+  return undefined;
+}
+
 /*───────────────────── AddInData Booking Data Provider ─────────────────────*/
 
 export class AddInDataBookingDataProvider implements BookingDataProvider, NotificationDataProvider {
   private readonly api: GeotabApi | null;
   private readonly addInId: string | null;
   private readonly groupId: string;
+  private readonly serverAuthz: ServerAuthzClient | null;
+  private creds: ServerAuthzSessionCreds | null;
 
-  /*───────────────────── Simple TTL cache for read performance ─────────────────────*/
-  /* Master data (devices/users/groups) changes infrequently; cache with TTL.
-     Booking results are cached and invalidated on any write. */
-  private static readonly MASTER_DATA_TTL_MS = 5 * 60 * 1000; // 5 minutes
-  private static readonly BOOKING_CACHE_TTL_MS = 30 * 1000; // 30 seconds
+  /*───────────────────── Read cache & request coalescing ─────────────────────*/
+  /* Master data (devices/users/groups) changes infrequently; cached with a
+     longer TTL and fetched together via ExecuteMultiCall on a cold cache.
+     AddInData query results are cached with a short TTL and coalesced so
+     identical concurrent reads share one network call. All read caches are
+     invalidated after any write. */
+  private masterCache: { devices: RawMyGeotabDevice[]; users: RawMyGeotabUser[]; groups: RawMyGeotabGroup[]; ts: number } | null = null;
+  private masterInFlight: Promise<{ devices: RawMyGeotabDevice[]; users: RawMyGeotabUser[]; groups: RawMyGeotabGroup[] }> | null = null;
+  private readonly recordsCache = new RequestCache<AddInDataRecord[]>(RECORDS_CACHE_TTL_MS);
 
-  private masterDataCache: { devices: RawMyGeotabDevice[]; users: RawMyGeotabUser[]; groups: RawMyGeotabGroup[]; ts: number } | null = null;
-  private bookingCache: { bookings: ResolvedBooking[]; ts: number } | null = null;
-
-  constructor(api: GeotabApi | null, addInId: string | null, groupId: string = DEFAULT_GROUP_ID) {
+  constructor(api: GeotabApi | null, addInId: string | null, groupId: string = DEFAULT_GROUP_ID, serverAuthz: ServerAuthzClient | null = null, creds: ServerAuthzSessionCreds | null = null) {
     this.api = api;
     this.addInId = addInId;
     this.groupId = groupId;
+    this.serverAuthz = serverAuthz;
+    this.creds = creds;
     diagLog("AddInDataBookingDataProvider constructed", {
       hasApi: !!api,
       hasAddInId: !!addInId,
       addInIdValid: addInId ? isValidAddInId(addInId) : false,
+      hasServerAuthz: !!serverAuthz,
+      hasCreds: !!creds,
     });
   }
 
-  private invalidateBookingCache(): void {
-    this.bookingCache = null;
+  /* Update session credentials used for Worker-routed protected writes.
+     Called by App.tsx when the MyGeotab identity resolves. */
+  setCredentials(creds: ServerAuthzSessionCreds | null): void {
+    this.creds = creds;
+    diagLog("AddInDataBookingDataProvider credentials updated", { hasCreds: !!creds });
   }
 
-  private invalidateMasterDataCache(): void {
-    this.masterDataCache = null;
+  /* Invalidate every read cache after a write so subsequent reads are fresh. */
+  private invalidateAllReadCaches(): void {
+    this.recordsCache.invalidate();
+    this.masterCache = null;
+    this.masterInFlight = null;
+  }
+
+  /* Route a protected booking write through the Cloudflare Authorization
+     Worker (/authz/execute). The Worker independently verifies the session,
+     enforces RBAC, computes the SHA-256 payload fingerprint, enforces
+     idempotency, and performs the AddInData write using the service account.
+
+     When both serverAuthz and session creds are present (the LIVE path wired by
+     App.tsx), the write is sent to the Worker and the Worker's response is
+     returned verbatim. Otherwise a direct apiCall is performed — this branch
+     exists only for non-server/test contexts and is never reached on the LIVE
+     path, because App.tsx calls authorizeServerAction() first, which throws
+     SERVER_AUTHZ_NOT_CONFIGURED in ADDIN_DATA mode when creds/serverAuthz are
+     missing. This method does not itself distinguish LIVE from DEMO; the
+     fail-closed guarantee for LIVE is enforced by that caller gate. */
+  private async executeProtectedWrite<T>(
+    action: string,
+    bookingId: string,
+    bookingData: Record<string, unknown> | null,
+    operation: "add" | "set" | "remove",
+    recordId?: string,
+  ): Promise<{ success: true; recordId: string; actorUserId: string } | { success: false; error: string; reason: string }> {
+    if (this.serverAuthz && this.creds) {
+      /* Deterministic idempotency key: stable across retries of the same logical
+         operation (same action/booking/operation/record/version) so the Worker
+         can deduplicate, while distinct transitions (different version) get a
+         distinct key and never false-conflict. The Worker requires this key. */
+      const version = (bookingData as { version?: unknown } | null)?.version;
+      const idempotencyKey = `idem:${action}:${bookingId}:${operation}:${recordId ?? ""}:${version ?? ""}`;
+      const result = await this.serverAuthz.execute(
+        this.creds.sessionId,
+        this.creds.database,
+        this.creds.server,
+        action,
+        bookingId,
+        bookingData ?? undefined,
+        operation,
+        recordId,
+        idempotencyKey,
+        this.creds.userName,
+      );
+      return result;
+    }
+    /* DEMO mode: direct write (no server authorization required) */
+    if (operation === "add") {
+      const response = await this.apiCall<{ id?: string }>("Add", {
+        typeName: "AddInData",
+        entity: {
+          addInId: this.addInId,
+          details: bookingData,
+          groups: [{ id: this.groupId }],
+        },
+      });
+      return {
+        success: true,
+        recordId: response?.id ?? bookingId,
+        actorUserId: (bookingData as { actorUserId?: string })?.actorUserId ?? "",
+      };
+    }
+    if (operation === "set" && recordId) {
+      await this.apiCall<unknown>("Set", {
+        typeName: "AddInData",
+        entity: {
+          addInId: this.addInId,
+          id: recordId,
+          details: bookingData,
+          groups: [{ id: this.groupId }],
+        },
+      });
+      return { success: true, recordId, actorUserId: "" };
+    }
+    if (operation === "remove" && recordId) {
+      await this.apiCall<unknown>("Remove", {
+        typeName: "AddInData",
+        entity: { id: recordId },
+      });
+      return { success: true, recordId, actorUserId: "" };
+    }
+    return { success: false, error: "SERVER_AUTHZ_NOT_CONFIGURED", reason: "SERVER_AUTHZ_NOT_CONFIGURED" };
+  }
+
+  /* Load master data (Device/User/Group) in a single ExecuteMultiCall
+     round-trip when the cache is cold, coalescing concurrent callers. Falls
+     back to individual Get calls internally when ExecuteMultiCall is
+     unavailable or fails. */
+  private async ensureMasterData(): Promise<{ devices: RawMyGeotabDevice[]; users: RawMyGeotabUser[]; groups: RawMyGeotabGroup[] }> {
+    const now = Date.now();
+    if (this.masterCache && now - this.masterCache.ts < MASTER_DATA_TTL_MS) {
+      return { devices: this.masterCache.devices, users: this.masterCache.users, groups: this.masterCache.groups };
+    }
+    if (this.masterInFlight) return this.masterInFlight;
+
+    const call = this.api?.call;
+    const requests: MultiGetRequest[] = [
+      { typeName: "Device", resultsLimit: MASTER_DATA_LIMIT },
+      { typeName: "User", resultsLimit: MASTER_DATA_LIMIT },
+      { typeName: "Group", resultsLimit: MASTER_DATA_LIMIT },
+    ];
+
+    this.masterInFlight = (async () => {
+      const results = await executeMultiGet<unknown>(call ?? null, requests);
+      const devices = (results[0] ?? []) as RawMyGeotabDevice[];
+      const users = (results[1] ?? []) as RawMyGeotabUser[];
+      const groups = (results[2] ?? []) as RawMyGeotabGroup[];
+      const data = { devices, users, groups };
+      this.masterCache = { devices, users, groups, ts: Date.now() };
+      return data;
+    })();
+
+    try {
+      return await this.masterInFlight;
+    } finally {
+      this.masterInFlight = null;
+    }
+  }
+
+  /* Execute a selective, bounded AddInData Get. A recordType whereClause is
+     added as a server-side optimization when provided; client-side filtering
+     via classifyRecordType / explicit filters remains authoritative so legacy
+     records (which lack recordType) are never silently dropped when a mock or
+     older runtime ignores the whereClause. */
+  private async queryAddInData(recordType: string | undefined, resultsLimit?: number): Promise<AddInDataRecord[]> {
+    const search: Record<string, unknown> = { addInId: this.addInId };
+    if (recordType) {
+      search.whereClause = `details.recordType = "${recordType}"`;
+    }
+    if (typeof resultsLimit === "number") {
+      search.resultsLimit = resultsLimit;
+    }
+    return (await this.apiCall<AddInDataRecord[]>("Get", { typeName: "AddInData", search })) ?? [];
+  }
+
+  /* Fetch a selective record type through the short-TTL request cache so
+     identical concurrent/repeated reads share one network call, and are
+     invalidated after every write. */
+  private async queryAddInDataCached(recordType: string, resultsLimit: number): Promise<AddInDataRecord[]> {
+    return this.recordsCache.fetch(`records:${recordType}`, async () => {
+      return this.queryAddInData(recordType, resultsLimit);
+    });
   }
 
   /*───────────────────── JSON-RPC wrapper over geotab.addin API ─────────────────────*/
@@ -293,12 +516,12 @@ export class AddInDataBookingDataProvider implements BookingDataProvider, Notifi
         reject(new Error("GEOTAB_API_NOT_AVAILABLE: running outside MyGeotab Add-In context"));
         return;
       }
-      if ((method === "Add" || method === "Set" || method === "Remove") && !this.addInId) {
+      if ((method === "Add" || method === "Set" || method === "Remove" || method === "Delete") && !this.addInId) {
         diagLog("AddInData API call failed: addInId not configured", { method });
         reject(new Error("ADDIN_ID_NOT_CONFIGURED: set addInId before using AddInData storage"));
         return;
       }
-      if ((method === "Add" || method === "Set" || method === "Remove") && this.addInId && !isValidAddInId(this.addInId)) {
+      if ((method === "Add" || method === "Set" || method === "Remove" || method === "Delete") && this.addInId && !isValidAddInId(this.addInId)) {
         diagLog("AddInData API call failed: addInId invalid format", { method });
         reject(new Error("ADDIN_ID_INVALID: stored addInId does not match Geotab Storage API format. Enter a valid AddInId."));
         return;
@@ -316,26 +539,17 @@ export class AddInDataBookingDataProvider implements BookingDataProvider, Notifi
   /*───────────────────── Read-only master data (live from MyGeotab) ─────────────────────*/
 
   async getAssets(): Promise<ResolvedAsset[]> {
-    const devices = await this.apiCall<RawMyGeotabDevice[]>("Get", {
-      typeName: "Device",
-      resultsLimit: 1000,
-    });
+    const devices = await this.getDevicesRaw();
     return devices.map(mapLiveAsset);
   }
 
   async getUsers(): Promise<ResolvedUser[]> {
-    const users = await this.apiCall<RawMyGeotabUser[]>("Get", {
-      typeName: "User",
-      resultsLimit: 1000,
-    });
+    const users = await this.getUsersRaw();
     return users.map(mapLiveUser);
   }
 
   async getGroups(): Promise<MyGeotabGroup[]> {
-    const groups = await this.apiCall<RawMyGeotabGroup[]>("Get", {
-      typeName: "Group",
-      resultsLimit: 1000,
-    });
+    const groups = await this.getGroupsRaw();
     return groups.map(mapLiveGroup);
   }
 
@@ -350,50 +564,31 @@ export class AddInDataBookingDataProvider implements BookingDataProvider, Notifi
   /*───────────────────── Booking transactions (AddInData storage) ─────────────────────*/
 
   private async getDevicesRaw(): Promise<RawMyGeotabDevice[]> {
-    const now = Date.now();
-    if (this.masterDataCache && now - this.masterDataCache.ts < AddInDataBookingDataProvider.MASTER_DATA_TTL_MS) {
-      return this.masterDataCache.devices;
-    }
-    const devices = await this.apiCall<RawMyGeotabDevice[]>("Get", { typeName: "Device", resultsLimit: 1000 });
-    this.masterDataCache = { devices, users: this.masterDataCache?.users ?? [], groups: this.masterDataCache?.groups ?? [], ts: now };
-    return devices;
+    const master = await this.ensureMasterData();
+    return master.devices;
   }
 
   private async getUsersRaw(): Promise<RawMyGeotabUser[]> {
-    const now = Date.now();
-    if (this.masterDataCache && now - this.masterDataCache.ts < AddInDataBookingDataProvider.MASTER_DATA_TTL_MS) {
-      return this.masterDataCache.users;
-    }
-    const users = await this.apiCall<RawMyGeotabUser[]>("Get", { typeName: "User", resultsLimit: 1000 });
-    this.masterDataCache = { devices: this.masterDataCache?.devices ?? [], users, groups: this.masterDataCache?.groups ?? [], ts: now };
-    return users;
+    const master = await this.ensureMasterData();
+    return master.users;
   }
 
   private async getGroupsRaw(): Promise<RawMyGeotabGroup[]> {
-    const now = Date.now();
-    if (this.masterDataCache && now - this.masterDataCache.ts < AddInDataBookingDataProvider.MASTER_DATA_TTL_MS) {
-      return this.masterDataCache.groups;
-    }
-    const groups = await this.apiCall<RawMyGeotabGroup[]>("Get", { typeName: "Group", resultsLimit: 1000 });
-    this.masterDataCache = { devices: this.masterDataCache?.devices ?? [], users: this.masterDataCache?.users ?? [], groups, ts: now };
-    return groups;
+    const master = await this.ensureMasterData();
+    return master.groups;
   }
 
   async getBookings(): Promise<ResolvedBooking[]> {
-    const now = Date.now();
-    if (this.bookingCache && now - this.bookingCache.ts < AddInDataBookingDataProvider.BOOKING_CACHE_TTL_MS) {
-      return this.bookingCache.bookings;
-    }
-    const records = await this.apiCall<AddInDataRecord[]>("Get", {
-      typeName: "AddInData",
-      search: { addInId: this.addInId },
-    });
-    const devices = await this.getDevicesRaw();
-    const users = await this.getUsersRaw();
+    const [records, devices, users] = await Promise.all([
+      this.queryAddInDataCached("booking", BOOKING_QUERY_LIMIT),
+      this.getDevicesRaw(),
+      this.getUsersRaw(),
+    ]);
     const deviceMap = new Map(devices.map(d => [d.id, d]));
     const userMap = new Map(users.map(u => [u.id, u]));
-    const bookings = (records || []).map(r => resolveAddInDataBooking(r, deviceMap, userMap));
-    this.bookingCache = { bookings, ts: now };
+    const bookings = (records || [])
+      .filter(r => classifyRecordType(r.details) === "booking")
+      .map(r => resolveAddInDataBooking(r, deviceMap, userMap));
     return bookings;
   }
 
@@ -449,17 +644,18 @@ export class AddInDataBookingDataProvider implements BookingDataProvider, Notifi
     };
 
     const details = serializeBooking(booking);
-    const response = await this.apiCall<{ id?: string }>("Add", {
-      typeName: "AddInData",
-      entity: {
-        addInId: this.addInId,
-        details,
-        groups: [{ id: this.groupId }],
-      },
-    });
-    this.invalidateBookingCache();
-    if (response?.id) {
-      booking.id = response.id;
+    const writeResult = await this.executeProtectedWrite(
+      "create_booking",
+      businessId,
+      details as unknown as Record<string, unknown>,
+      "add",
+    );
+    if (!writeResult.success) {
+      throw new Error(`WORKER_WRITE_FAILED: ${writeResult.error}`);
+    }
+    this.invalidateAllReadCaches();
+    if (writeResult.recordId) {
+      booking.id = writeResult.recordId;
     }
 
     const resolved = await this.getBookings();
@@ -478,16 +674,24 @@ export class AddInDataBookingDataProvider implements BookingDataProvider, Notifi
     if (approvalRemarks !== undefined) booking.approvalRemarks = approvalRemarks;
     booking.updatedAt = new Date().toISOString();
     booking.version = (booking.version || 0) + 1;
-    await this.apiCall<unknown>("Set", {
-      typeName: "AddInData",
-      entity: {
-        addInId: this.addInId,
-        id: record.id,
-        details: serializeBooking(booking),
-        groups: [{ id: this.groupId }],
-      },
-    });
-    this.invalidateBookingCache();
+    /* Map the target status to the canonical Worker action name. Unknown
+       statuses fail closed rather than sending an unrecognized action that the
+       Worker would reject with UNKNOWN_ACTION. */
+    const action = STATUS_TO_ACTION[status];
+    if (!action) {
+      throw new Error(`UNSUPPORTED_STATUS_ACTION: ${status}`);
+    }
+    const writeResult = await this.executeProtectedWrite(
+      action,
+      id,
+      serializeBooking(booking) as unknown as Record<string, unknown>,
+      "set",
+      record.id,
+    );
+    if (!writeResult.success) {
+      throw new Error(`WORKER_WRITE_FAILED: ${writeResult.error}`);
+    }
+    this.invalidateAllReadCaches();
   }
 
   /**
@@ -496,12 +700,11 @@ export class AddInDataBookingDataProvider implements BookingDataProvider, Notifi
    *   - record.id === bookingId (server record ID)
    *   - deserializeBooking(record.details).id === bookingId (application ID stored in details)
    * Malformed details are skipped gracefully so a single bad record cannot break the lookup.
+   * Performs a fresh bounded Get each call so server-assigned IDs and legacy
+   * records written outside this provider instance are always visible.
    */
   async findBookingRecord(bookingId: string): Promise<AddInDataRecord | null> {
-    const records = await this.apiCall<AddInDataRecord[]>("Get", {
-      typeName: "AddInData",
-      search: { addInId: this.addInId },
-    });
+    const records = await this.queryAddInData(undefined, BOOKING_QUERY_LIMIT);
     for (const record of records || []) {
       if (record.id === bookingId) return record;
       try {
@@ -517,11 +720,17 @@ export class AddInDataBookingDataProvider implements BookingDataProvider, Notifi
   async deleteBooking(id: string): Promise<void> {
     const record = await this.findBookingRecord(id);
     if (!record) throw new Error(`BOOKING_NOT_FOUND: ${id}`);
-    await this.apiCall<unknown>("Remove", {
-      typeName: "AddInData",
-      entity: { id: record.id },
-    });
-    this.invalidateBookingCache();
+    const writeResult = await this.executeProtectedWrite(
+      "delete_booking",
+      id,
+      null,
+      "remove",
+      record.id,
+    );
+    if (!writeResult.success) {
+      throw new Error(`WORKER_WRITE_FAILED: ${writeResult.error}`);
+    }
+    this.invalidateAllReadCaches();
   }
 
   async resetDemoData(): Promise<void> {
@@ -531,10 +740,7 @@ export class AddInDataBookingDataProvider implements BookingDataProvider, Notifi
 
   /*───────────────────── Notification operations (AddInData) ─────────────────────*/
   async getNotifications(userId: string, opts?: { limit?: number; offset?: number; unreadOnly?: boolean; type?: NotificationType }): Promise<OpexNotification[]> {
-    const records = await this.apiCall<AddInDataRecord[]>("Get", {
-      typeName: "AddInData",
-      search: { addInId: this.addInId },
-    });
+    const records = await this.queryAddInDataCached("notification", NOTIFICATION_QUERY_LIMIT);
     return (records || [])
       .map(r => deserializeNotification(r.details))
       .filter(n => n.recipient_user_id === userId)
@@ -545,10 +751,7 @@ export class AddInDataBookingDataProvider implements BookingDataProvider, Notifi
   }
 
   async getUnreadCount(userId: string): Promise<number> {
-    const records = await this.apiCall<AddInDataRecord[]>("Get", {
-      typeName: "AddInData",
-      search: { addInId: this.addInId },
-    });
+    const records = await this.queryAddInDataCached("notification", NOTIFICATION_QUERY_LIMIT);
     return (records || [])
       .map(r => deserializeNotification(r.details))
       .filter(n => n.recipient_user_id === userId && !n.is_read).length;
@@ -594,14 +797,12 @@ export class AddInDataBookingDataProvider implements BookingDataProvider, Notifi
         groups: [{ id: NOTIFICATION_GROUP_ID }],
       },
     });
+    this.invalidateAllReadCaches();
     return notification;
   }
 
   async findByIdempotencyKey(idempotencyKey: string): Promise<OpexNotification | null> {
-    const records = await this.apiCall<AddInDataRecord[]>("Get", {
-      typeName: "AddInData",
-      search: { addInId: this.addInId },
-    });
+    const records = await this.queryAddInDataCached("notification", NOTIFICATION_QUERY_LIMIT);
     for (const record of records || []) {
       try {
         const n = deserializeNotification(record.details);
@@ -613,11 +814,8 @@ export class AddInDataBookingDataProvider implements BookingDataProvider, Notifi
     return null;
   }
 
-  async markAsRead(notificationId: string): Promise<void> {
-    const records = await this.apiCall<AddInDataRecord[]>("Get", {
-      typeName: "AddInData",
-      search: { addInId: this.addInId },
-    });
+  async markAsRead(notificationId: string, actorUserId: string): Promise<void> {
+    const records = await this.queryAddInDataCached("notification", NOTIFICATION_QUERY_LIMIT);
     const record = (records || []).find(r => {
       try {
         return deserializeNotification(r.details).id === notificationId;
@@ -627,6 +825,12 @@ export class AddInDataBookingDataProvider implements BookingDataProvider, Notifi
     });
     if (!record) return;
     const n = deserializeNotification(record.details);
+    /* Recipient ownership validation (mandatory): only the verified actor may
+       mark their own notifications as read. Fail closed when the actor is
+       missing/blank or does not own the notification. */
+    if (!actorUserId || !actorUserId.trim() || n.recipient_user_id !== actorUserId) {
+      return;
+    }
     n.is_read = true;
     n.updated_at = new Date().toISOString();
     await this.apiCall<unknown>("Set", {
@@ -638,13 +842,17 @@ export class AddInDataBookingDataProvider implements BookingDataProvider, Notifi
         groups: [{ id: NOTIFICATION_GROUP_ID }],
       },
     });
+    this.invalidateAllReadCaches();
   }
 
-  async markAllAsRead(userId: string): Promise<void> {
-    const records = await this.apiCall<AddInDataRecord[]>("Get", {
-      typeName: "AddInData",
-      search: { addInId: this.addInId },
-    });
+  async markAllAsRead(userId: string, actorUserId: string): Promise<void> {
+    /* Mandatory actor validation: only the verified actor may mark their own
+       notifications as read. Fail closed when the actor is missing/blank or
+       the target userId is not the actor. Prevents cross-user marking. */
+    if (!actorUserId || !actorUserId.trim() || userId !== actorUserId) {
+      return;
+    }
+    const records = await this.queryAddInDataCached("notification", NOTIFICATION_QUERY_LIMIT);
     const now = new Date().toISOString();
     for (const record of records || []) {
       try {
@@ -666,13 +874,11 @@ export class AddInDataBookingDataProvider implements BookingDataProvider, Notifi
         // Skip malformed records
       }
     }
+    this.invalidateAllReadCaches();
   }
 
-  async markDeliveryStatus(notificationId: string, status: "pending" | "delivered" | "failed"): Promise<void> {
-    const records = await this.apiCall<AddInDataRecord[]>("Get", {
-      typeName: "AddInData",
-      search: { addInId: this.addInId },
-    });
+  async markDeliveryStatus(notificationId: string, status: "pending" | "delivered" | "failed", actorUserId: string): Promise<void> {
+    const records = await this.queryAddInDataCached("notification", NOTIFICATION_QUERY_LIMIT);
     const record = (records || []).find(r => {
       try {
         return deserializeNotification(r.details).id === notificationId;
@@ -682,6 +888,12 @@ export class AddInDataBookingDataProvider implements BookingDataProvider, Notifi
     });
     if (!record) return;
     const n = deserializeNotification(record.details);
+    /* Recipient ownership validation (mandatory): only the verified actor may
+       update delivery status for their own notifications. Fail closed when the
+       actor is missing/blank or does not own the notification. */
+    if (!actorUserId || !actorUserId.trim() || n.recipient_user_id !== actorUserId) {
+      return;
+    }
     n.delivery_status = status;
     n.delivered_at = status === "delivered" ? new Date().toISOString() : n.delivered_at;
     n.updated_at = new Date().toISOString();
@@ -694,6 +906,7 @@ export class AddInDataBookingDataProvider implements BookingDataProvider, Notifi
         groups: [{ id: NOTIFICATION_GROUP_ID }],
       },
     });
+    this.invalidateAllReadCaches();
   }
 
   /*───────────────────── Audit operations (AddInData) ─────────────────────*/
@@ -727,17 +940,64 @@ export class AddInDataBookingDataProvider implements BookingDataProvider, Notifi
         groups: [{ id: AUDIT_GROUP_ID }],
       },
     });
+    this.invalidateAllReadCaches();
   }
 
-  async getAuditRecords(bookingId: string): Promise<OpexBookingAudit[]> {
-    const records = await this.apiCall<AddInDataRecord[]>("Get", {
+  /* Store a canonical booking audit event (recordType "bookingAudit") as a
+     structured AddInData record. The `details` payload is the canonical event
+     object itself — never a nested JSON string — so `changes`, `actor` and
+     `metadata` remain queryable and readable. Immutable: a new record is
+     created for every event with a unique auditKey. */
+  async createBookingAuditEvent(input: CanonicalAuditInput): Promise<void> {
+    const event: OpexBookingAuditV2 = {
+      recordType: "bookingAudit",
+      schemaVersion: SCHEMA_VERSION,
+      auditKey: input.auditKey ?? generateCanonicalAuditKey(),
+      bookingKey: input.bookingKey,
+      action: input.action,
+      actor: input.actor,
+      occurredAtUtc: input.occurredAtUtc ?? new Date().toISOString(),
+      previousStatus: input.previousStatus ?? null,
+      newStatus: input.newStatus ?? null,
+      changes: input.changes,
+      metadata: input.metadata,
+    };
+    await this.apiCall<{ id?: string }>("Add", {
       typeName: "AddInData",
-      search: { addInId: this.addInId },
+      entity: {
+        addInId: this.addInId,
+        details: event,
+        groups: [{ id: AUDIT_GROUP_ID }],
+      },
     });
-    return (records || [])
-      .map(r => deserializeAudit(r.details))
-      .filter(a => a.booking_id === bookingId)
-      .sort((a, b) => new Date(b.created_at).getTime() - new Date(a.created_at).getTime());
+    this.invalidateAllReadCaches();
+  }
+
+  async getAuditRecords(bookingId: string): Promise<NormalizedAuditEvent[]> {
+    /* Query the legacy "booking_audit" records first (index 0) so existing
+       selective-query contracts are honored, then canonical "bookingAudit"
+       records. Both formats are normalized to a common in-memory shape so
+       legacy and canonical records can coexist and be displayed together. */
+    const [legacyRecords, canonicalRecords] = await Promise.all([
+      this.queryAddInDataCached("booking_audit", AUDIT_QUERY_LIMIT),
+      this.queryAddInDataCached("bookingAudit", AUDIT_QUERY_LIMIT),
+    ]);
+    const normalized: NormalizedAuditEvent[] = [];
+    for (const r of legacyRecords || []) {
+      const n = normalizeAuditRecord(deserializeAudit(r.details), r.id);
+      if (n) normalized.push(n);
+    }
+    for (const r of canonicalRecords || []) {
+      const n = normalizeAuditRecord(deserializeBookingAudit(r.details), r.id);
+      if (n) normalized.push(n);
+    }
+    return normalized
+      .filter(a => a.bookingKey === bookingId)
+      .sort((a, b) => {
+        const da = a.occurredAtUtc ? new Date(a.occurredAtUtc).getTime() : 0;
+        const db = b.occurredAtUtc ? new Date(b.occurredAtUtc).getTime() : 0;
+        return db - da;
+      });
   }
 
   async createAuditPending(input: Omit<OpexAuditPending, "id" | "schemaVersion" | "recordType" | "created_at" | "retry_count" | "next_retry_at">): Promise<OpexAuditPending> {
@@ -767,14 +1027,12 @@ export class AddInDataBookingDataProvider implements BookingDataProvider, Notifi
         groups: [{ id: AUDIT_PENDING_GROUP_ID }],
       },
     });
+    this.invalidateAllReadCaches();
     return record;
   }
 
   async getAuditPending(): Promise<OpexAuditPending[]> {
-    const records = await this.apiCall<AddInDataRecord[]>("Get", {
-      typeName: "AddInData",
-      search: { addInId: this.addInId },
-    });
+    const records = await this.queryAddInDataCached("booking_audit", AUDIT_QUERY_LIMIT);
     return (records || [])
       .map(r => deserializeAuditPending(r.details))
       .filter(p => p.recordType === "booking_audit")
@@ -786,10 +1044,8 @@ export class AddInDataBookingDataProvider implements BookingDataProvider, Notifi
   }
 
   async deleteAuditPending(id: string): Promise<void> {
-    const records = await this.apiCall<AddInDataRecord[]>("Get", {
-      typeName: "AddInData",
-      search: { addInId: this.addInId },
-    });
+    if (!id || id.trim() === "") return;
+    const records = await this.queryAddInDataCached("booking_audit", AUDIT_QUERY_LIMIT);
     const record = (records || []).find(r => {
       try {
         return deserializeAuditPending(r.details).id === id;
@@ -798,6 +1054,10 @@ export class AddInDataBookingDataProvider implements BookingDataProvider, Notifi
       }
     });
     if (!record) return;
+    /* Sanity check: only delete records that are genuinely pending audits
+       (recordType booking_audit) with a valid server record ID. */
+    const pending = deserializeAuditPending(record.details);
+    if (pending.recordType !== "booking_audit" || !record.id || record.id.trim() === "") return;
     await this.apiCall<unknown>("Delete", {
       typeName: "AddInData",
       entity: {
@@ -805,6 +1065,7 @@ export class AddInDataBookingDataProvider implements BookingDataProvider, Notifi
         id: record.id,
       },
     });
+    this.invalidateAllReadCaches();
   }
 
   async createAuditDeadLetter(input: Omit<OpexAuditDeadLetter, "id" | "schemaVersion" | "recordType" | "created_at" | "dead_lettered_at">): Promise<OpexAuditDeadLetter> {
@@ -836,14 +1097,12 @@ export class AddInDataBookingDataProvider implements BookingDataProvider, Notifi
         groups: [{ id: AUDIT_DEAD_LETTER_GROUP_ID }],
       },
     });
+    this.invalidateAllReadCaches();
     return record;
   }
 
   async getAuditDeadLetters(): Promise<OpexAuditDeadLetter[]> {
-    const records = await this.apiCall<AddInDataRecord[]>("Get", {
-      typeName: "AddInData",
-      search: { addInId: this.addInId },
-    });
+    const records = await this.queryAddInDataCached("audit_dead_letter", DEAD_LETTER_QUERY_LIMIT);
     return (records || [])
       .map(r => deserializeAuditDeadLetter(r.details))
       .filter(d => d.recordType === "audit_dead_letter")
@@ -859,10 +1118,7 @@ export class AddInDataBookingDataProvider implements BookingDataProvider, Notifi
   }
 
   async getApprovers(): Promise<ResolvedUser[]> {
-    const users = await this.apiCall<RawMyGeotabUser[]>("Get", {
-      typeName: "User",
-      resultsLimit: 1000,
-    });
+    const users = await this.getUsersRaw();
     return (users || [])
       .filter(u => u.role === "APPROVER")
       .map(mapLiveUser);
@@ -880,8 +1136,8 @@ export {
 };
 
 
-export function createAddInDataProvider(api: GeotabApi | null, addInId: string | null): AddInDataBookingDataProvider {
-  return new AddInDataBookingDataProvider(api, addInId);
+export function createAddInDataProvider(api: GeotabApi | null, addInId: string | null, serverAuthz: ServerAuthzClient | null = null): AddInDataBookingDataProvider {
+  return new AddInDataBookingDataProvider(api, addInId, DEFAULT_GROUP_ID, serverAuthz);
 }
 
 /*───────────────────── Resolve helpers ─────────────────────*/

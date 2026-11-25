@@ -6,7 +6,7 @@
 
 /*───────────────────── Types ─────────────────────*/
 
-import type { OpexReconciliationFinding, ReconciliationFindingType, ResolvedBooking, OpexBookingAudit, ReconciliationRunState } from "./data/types";
+import type { OpexReconciliationFinding, ResolvedBooking, ReconciliationRunState, NormalizedAuditEvent, OpexBookingAuditV2, ActorInfo, AuditChange, AuditMetadata } from "./data/types";
 
 type LocalStorageService = {
   get?: (key: string) => Promise<string | null>;
@@ -280,6 +280,41 @@ function isValidAddInIdLocal(value: string | null): boolean {
   return /^a[A-Za-z0-9_-]{22}$/.test(value);
 }
 
+/*───────────────────── Polling overlap guard & backoff ─────────────────────*/
+/* Self-contained (no imports) because the Service Add-In is compiled as a
+   standalone bundle with `--module None`. createOverlapGuard prevents
+   overlapping notification polls (a slow poll must not stack with the next
+   interval tick). computeBackoffMs provides bounded exponential backoff for
+   callers that need retry pacing after transient errors. */
+
+export type OverlapGuard = {
+  readonly running: boolean;
+  run<T>(fn: () => Promise<T>): Promise<T | undefined>;
+};
+
+export function createOverlapGuard(): OverlapGuard {
+  let running = false;
+  return {
+    get running() {
+      return running;
+    },
+    async run<T>(fn: () => Promise<T>): Promise<T | undefined> {
+      if (running) return undefined;
+      running = true;
+      try {
+        return await fn();
+      } finally {
+        running = false;
+      }
+    },
+  };
+}
+
+export function computeBackoffMs(attempt: number, baseMs: number, maxMs: number): number {
+  const a = Math.max(0, Math.floor(attempt));
+  return Math.min(baseMs * 2 ** a, maxMs);
+}
+
 /*───────────────────── Notification Delivery ─────────────────────*/
 
 async function deliverPendingNotifications(service: ServiceAddIn): Promise<void> {
@@ -429,24 +464,63 @@ async function runReconciliation(
   await markReconciliationInProgress(localStorage);
 
   try {
-    /* Fetch all relevant record types from AddInData */
-    const [bookingRecords, auditRecords, notificationRecords] = await Promise.all([
-      fetchAddInDataRecords(service, addInId, 'details.recordType = "booking"', MAX_FINDINGS_PER_RUN),
-      fetchAddInDataRecords(service, addInId, 'details.recordType = "booking_audit"', MAX_FINDINGS_PER_RUN),
-      fetchAddInDataRecords(service, addInId, 'details.recordType = "notification"', MAX_FINDINGS_PER_RUN),
-    ]);
+    /* Fetch all relevant record types from AddInData.
+       Audit records are retrieved in TWO separate queries because MyGeotab
+       AddInData does not support OR conditions — legacy "booking_audit" and
+       canonical "bookingAudit" must each be queried with its own whereClause.
+       This adds exactly one additional Get call per reconciliation run
+       (3 -> 4 total: booking, booking_audit, bookingAudit, notification). */
+    const [bookingRecords, legacyAuditRecords, canonicalAuditRecords, notificationRecords] =
+      await Promise.all([
+        fetchAddInDataRecords(service, addInId, 'details.recordType = "booking"', MAX_FINDINGS_PER_RUN),
+        fetchAddInDataRecords(service, addInId, 'details.recordType = "booking_audit"', MAX_FINDINGS_PER_RUN),
+        fetchAddInDataRecords(service, addInId, 'details.recordType = "bookingAudit"', MAX_FINDINGS_PER_RUN),
+        fetchAddInDataRecords(service, addInId, 'details.recordType = "notification"', MAX_FINDINGS_PER_RUN),
+      ]);
 
-    /* Deserialize records */
+    /* Deserialize bookings */
     const bookings: ResolvedBooking[] = [];
     for (const r of bookingRecords) {
       const b = (typeof r.details === "string" ? JSON.parse(r.details) : r.details) as ResolvedBooking;
       if (b) bookings.push(b);
     }
 
-    const audits: OpexBookingAudit[] = [];
-    for (const r of auditRecords) {
-      const a = (typeof r.details === "string" ? JSON.parse(r.details) : r.details) as OpexBookingAudit;
-      if (a) audits.push(a);
+    /* Normalize both audit formats through the shared normalization layer.
+       Legacy "booking_audit" and canonical "bookingAudit" are normalized to
+       a common in-memory shape so they can be reconciled together. Records
+       that cannot be normalized are preserved as insufficient-evidence
+       entries rather than silently discarded. */
+    const auditTrailModule = await import("./audit/auditTrail");
+    const reconcileAuditEnhanced = auditTrailModule.reconcileAuditEnhanced;
+    const toOpexReconciliationFinding = auditTrailModule.toOpexReconciliationFinding;
+
+    const rawAuditRecords = [...legacyAuditRecords, ...canonicalAuditRecords];
+    const audits: NormalizedAuditEvent[] = [];
+    for (const r of rawAuditRecords) {
+      const normalized = typeof normalizeAuditRecord === "function"
+        ? normalizeAuditRecord(r.details, r.id)
+        : null;
+      if (normalized) {
+        audits.push(normalized);
+      } else {
+        /* Preserve malformed / unrecognized records as insufficient-evidence
+           entries so they are visible to administrators instead of dropped. */
+        audits.push({
+          recordType: "booking_audit",
+          schemaVersion: 1,
+          id: String(r.id ?? ""),
+          auditKey: undefined,
+          bookingKey: "",
+          action: "UNKNOWN",
+          actor: { userId: "" },
+          occurredAtUtc: undefined,
+          previousStatus: null,
+          newStatus: null,
+          changes: null,
+          metadata: null,
+          sourceFormat: "legacy",
+        });
+      }
     }
 
     const notifications: { id: string; booking_id: string; actor_user_id: string; created_at: string; type: string }[] = [];
@@ -454,11 +528,6 @@ async function runReconciliation(
       const n = (typeof r.details === "string" ? JSON.parse(r.details) : r.details) as { id: string; booking_id: string; actor_user_id: string; created_at: string; type: string };
       if (n) notifications.push(n);
     }
-
-    /* Run reconciliation engine via dynamic import (works with standalone tsc build) */
-    const auditTrailModule = await import("./audit/auditTrail");
-    const reconcileAuditEnhanced = auditTrailModule.reconcileAuditEnhanced;
-    const toOpexReconciliationFinding = auditTrailModule.toOpexReconciliationFinding;
 
     const findings = reconcileAuditEnhanced(bookings, audits, notifications);
 
@@ -535,16 +604,35 @@ if (typeof self !== "undefined") {
 
   selfGlobal.geotab.addin.service = (service: ServiceAddIn) => {
     diagLog("Service Add-In registered, initializing notification delivery and reconciliation");
-    // Deliver pending notifications on startup
-    deliverPendingNotifications(service).catch(() => {
-      // Swallow errors – Service Add-In must not crash
-    });
 
-    // Periodic polling for new pending notifications
-    const notificationInterval = setInterval(() => {
-      deliverPendingNotifications(service).catch(() => {
-        // Swallow errors
+    // Overlap guard: a slow notification poll must not stack with the next tick.
+    const notificationGuard = createOverlapGuard();
+
+    // Visibility-aware: skip polling while the host document is hidden.
+    const isVisible = (): boolean => {
+      try {
+        if (typeof document !== "undefined" && typeof document.hidden === "boolean") {
+          return !document.hidden;
+        }
+      } catch {
+        // Ignore — default to visible.
+      }
+      return true;
+    };
+
+    const runNotificationPoll = (): void => {
+      if (!isVisible()) return;
+      notificationGuard.run(() => deliverPendingNotifications(service)).catch(() => {
+        // Swallow errors – Service Add-In must not crash
       });
+    };
+
+    // Deliver pending notifications on startup
+    runNotificationPoll();
+
+    // Periodic polling for new pending notifications (overlap-guarded)
+    const notificationInterval = setInterval(() => {
+      runNotificationPoll();
     }, POLL_INTERVAL_MS);
 
     // Periodic audit reconciliation (longer interval than notification polling)
@@ -563,6 +651,77 @@ if (typeof self !== "undefined") {
   };
 }
 
+/*───────────────────── Audit normalization (local copy for standalone build) ─────────────────────*/
+/* The standalone Service Add-In bundle (--module ESNext, no
+   allowImportingTsExtensions) cannot statically import the runtime value
+   normalizeAuditRecord from ../data/types.ts. This local copy is identical to
+   the one in ../data/types.ts and is self-contained (no imports), so the
+   standalone build stays valid while the UI side uses the shared copy. */
+
+/* Guard: true when a parsed AddInData record is a canonical bookingAudit event. */
+function isCanonicalAudit(record: unknown): record is OpexBookingAuditV2 {
+  return typeof record === "object" && record !== null && (record as Record<string, unknown>).recordType === "bookingAudit";
+}
+
+/* Normalize any AddInData audit record (legacy or canonical) into a common
+   in-memory shape. Records that cannot be normalized return null; callers
+   should preserve them as insufficient-evidence entries rather than drop them. */
+function normalizeAuditRecord(
+  raw: unknown,
+  addInRecordId?: string,
+): NormalizedAuditEvent | null {
+  if (!raw || typeof raw !== "object") return null;
+  const obj = raw as Record<string, unknown>;
+  const recordType = obj.recordType;
+
+  if (recordType === "bookingAudit") {
+    const actorRaw = obj.actor && typeof obj.actor === "object" ? (obj.actor as Record<string, unknown>) : null;
+    const actor: ActorInfo = actorRaw
+      ? {
+          userId: String(actorRaw.userId ?? ""),
+          ...(typeof actorRaw.userName === "string" ? { userName: actorRaw.userName } : {}),
+          ...(typeof actorRaw.role === "string" ? { role: actorRaw.role } : {}),
+        }
+      : { userId: String(obj.actor_user_id ?? ""), userName: undefined, role: undefined };
+    return {
+      recordType: "bookingAudit",
+      schemaVersion: Number(obj.schemaVersion ?? 1),
+      id: String(obj.auditKey ?? obj.id ?? addInRecordId ?? ""),
+      auditKey: String(obj.auditKey ?? ""),
+      bookingKey: String(obj.bookingKey ?? obj.booking_id ?? ""),
+      action: String(obj.action ?? ""),
+      actor,
+      occurredAtUtc: typeof obj.occurredAtUtc === "string" ? obj.occurredAtUtc : undefined,
+      previousStatus: (obj.previousStatus as string | null) ?? null,
+      newStatus: (obj.newStatus as string | null) ?? null,
+      changes: obj.changes && typeof obj.changes === "object" ? (obj.changes as Record<string, AuditChange>) : null,
+      metadata: obj.metadata && typeof obj.metadata === "object" ? (obj.metadata as AuditMetadata) : null,
+      sourceFormat: "canonical",
+    };
+  }
+
+  /* Legacy "booking_audit" normalization. */
+  if (recordType === "booking_audit") {
+    return {
+      recordType: "booking_audit",
+      schemaVersion: Number(obj.schemaVersion ?? 1),
+      id: String(obj.id ?? addInRecordId ?? ""),
+      auditKey: undefined,
+      bookingKey: String(obj.booking_id ?? ""),
+      action: String(obj.action ?? ""),
+      actor: { userId: String(obj.actor_user_id ?? ""), userName: undefined, role: undefined },
+      occurredAtUtc: typeof obj.created_at === "string" ? obj.created_at : undefined,
+      previousStatus: (obj.previous_status as string | null) ?? null,
+      newStatus: (obj.new_status as string | null) ?? null,
+      changes: null,
+      metadata: null,
+      sourceFormat: "legacy",
+    };
+  }
+
+  return null;
+}
+
 /*───────────────────── Module export (for bundling and testing) ─────────────────────*/
 
 export {
@@ -575,6 +734,8 @@ export {
   markReconciliationComplete,
   isLockStale,
   recoverStaleLock,
+  normalizeAuditRecord,
+  isCanonicalAudit,
   type ServiceAddIn,
   type OpexNotification,
   type LocalStorageService,

@@ -7,6 +7,7 @@ export type BookingAction =
   | "complete_booking"
   | "cancel_booking"
   | "create_booking"
+  | "delete_booking"
   | "view_security_dashboard";
 
 export type UserRole = "EMPLOYEE" | "APPROVER" | "GA" | "MANAGEMENT" | "ADMIN";
@@ -55,6 +56,10 @@ export interface ExecutionRequest {
   idempotencyKey?: string;
   /** SHA-256 hex digest of the request payload, used to detect conflicting payloads under the same key. */
   payloadFingerprint?: string;
+  /** Write operation type: "add" (create), "set" (update), "remove" (delete). Defaults to "add". */
+  operation?: "add" | "set" | "remove";
+  /** Server record ID of the AddInData record to update or delete (required for set/remove). */
+  recordId?: string;
 }
 
 export type ExecutionResponse =

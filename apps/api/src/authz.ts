@@ -23,10 +23,12 @@ export type { AuthorizationRequest, ExecutionRequest };
 import {
   addInDataAdd,
   addInDataGet,
+  addInDataSet,
+  addInDataRemove,
   ServiceAccountSession,
   verifySession,
 } from "./integrations/mygeotab/client.ts";
-import type { AddInDataAddInput } from "./integrations/mygeotab/client.ts";
+import type { AddInDataAddInput, AddInDataSetInput, AddInDataRemoveInput } from "./integrations/mygeotab/client.ts";
 import { computePayloadFingerprint } from "./crypto.ts";
 
 /*───────────────────── Role Hierarchy ─────────────────────*/
@@ -46,6 +48,7 @@ const ACTION_REQUIRED_ROLE: Record<BookingAction, UserRole> = {
   complete_booking: "EMPLOYEE",
   cancel_booking: "EMPLOYEE",
   create_booking: "EMPLOYEE",
+  delete_booking: "EMPLOYEE",
   view_security_dashboard: "ADMIN",
 };
 
@@ -209,7 +212,15 @@ export async function handleExecute(
     payloadFingerprint = await computePayloadFingerprint({
       action: req.action,
       bookingId: req.bookingId,
-      bookingData: req.bookingData,
+      /* bookingData is absent for remove (delete) operations; canonicalize()
+         rejects `undefined`, so normalize to null to keep the fingerprint
+         computable. Objects pass through unchanged. */
+      bookingData: req.bookingData ?? null,
+      operation: req.operation,
+      /* recordId is absent for add operations; canonicalize() rejects
+         `undefined`, so normalize to null to keep the fingerprint computable.
+         set/remove always carry a string recordId, so this is a no-op for them. */
+      recordId: req.recordId ?? null,
     });
   } catch (e) {
     return {
@@ -245,51 +256,85 @@ export async function handleExecute(
     return (idemCheck as { found: true; result: ExecutionResponse }).result;
   }
 
-  /* 7. Build the booking record with verified actor attribution */
+  /* 7. Perform the AddInData write using service account (trusted, not client) */
   const now = new Date().toISOString();
-  const recordDetails: Record<string, unknown> = {
-    recordType: "booking",
-    schemaVersion: 1,
-    id: req.bookingId,
-    actorUserId: principal.userName,
-    action: req.action,
-    status: req.bookingData?.status || "PENDING_APPROVAL",
-    createdAt: now,
-    updatedAt: now,
-    ...(req.bookingData || {}),
-  };
-
-  /* 8. Perform AddInData write using service account (trusted, not client) */
-  const addInput: AddInDataAddInput = {
-    addInId,
-    details: recordDetails,
-  };
+  const operation = req.operation ?? "add";
 
   try {
-    const result = await addInDataAdd(env, serviceCreds, addInput);
+    let resultId: string;
+    let actorUserId = principal.userName;
 
-    /* 9. Record audit event with verified actor */
-    const auditDetails: Record<string, unknown> = {
-      recordType: "booking_audit",
-      schemaVersion: 1,
-      bookingId: req.bookingId,
-      action: req.action,
-      actorUserId: principal.userName,
-      actorDatabase: principal.database,
-      timestamp: now,
-      previousStatus: req.bookingData?.previousStatus || null,
-      newStatus: req.bookingData?.newStatus || null,
-    };
+    if (operation === "add") {
+      /* 7a. ADD: create a new booking record with verified actor attribution */
+      const recordDetails: Record<string, unknown> = {
+        recordType: "booking",
+        schemaVersion: 1,
+        id: req.bookingId,
+        actorUserId: principal.userName,
+        action: req.action,
+        status: req.bookingData?.status || "PENDING_APPROVAL",
+        createdAt: now,
+        updatedAt: now,
+        ...(req.bookingData || {}),
+      };
 
-    await addInDataAdd(env, serviceCreds, {
-      addInId,
-      details: auditDetails,
-    });
+      const addInput: AddInDataAddInput = {
+        addInId,
+        details: recordDetails,
+      };
 
+      const addResult = await addInDataAdd(env, serviceCreds, addInput);
+      resultId = addResult.id;
+    } else if (operation === "set") {
+      /* 7b. SET: update an existing booking record */
+      if (!req.recordId) {
+        return {
+          success: false,
+          error: "RECORD_ID_REQUIRED",
+          reason: "recordId is required for set operations",
+        };
+      }
+
+      const setInput: AddInDataSetInput = {
+        addInId,
+        id: req.recordId,
+        details: req.bookingData || {},
+        groups: req.bookingData?.groups
+          ? req.bookingData.groups
+          : [{ id: "GroupCompanyId" }],
+      };
+
+      await addInDataSet(env, serviceCreds, setInput);
+      resultId = req.recordId;
+    } else if (operation === "remove") {
+      /* 7c. REMOVE: delete an existing booking record */
+      if (!req.recordId) {
+        return {
+          success: false,
+          error: "RECORD_ID_REQUIRED",
+          reason: "recordId is required for remove operations",
+        };
+      }
+
+      await addInDataRemove(env, serviceCreds, {
+        addInId,
+        id: req.recordId,
+      });
+      resultId = req.recordId;
+    } else {
+      return {
+        success: false,
+        error: "UNKNOWN_OPERATION",
+        reason: `Unknown operation: ${operation}`,
+      };
+    }
+
+    /* 8. Return execution result. The frontend is responsible for emitting
+       the canonical audit event after a successful Worker write. */
     const executionResult: ExecutionResponse = {
       success: true,
-      recordId: result.id,
-      actorUserId: principal.userName,
+      recordId: resultId,
+      actorUserId,
     };
 
     if (req.idempotencyKey) {

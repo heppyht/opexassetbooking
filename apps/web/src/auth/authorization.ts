@@ -36,6 +36,7 @@ export function roleHasMinRank(role: string | undefined, minRole: UserRole): boo
 
 export type BookingAction =
   | "create_booking"
+  | "delete_booking"
   | "approve_booking"
   | "reject_booking"
   | "assign_driver"
@@ -53,6 +54,8 @@ export function canPerformAction(
 
   switch (action) {
     case "create_booking":
+      return roles.some(r => roleHasMinRank(r, "EMPLOYEE"));
+    case "delete_booking":
       return roles.some(r => roleHasMinRank(r, "EMPLOYEE"));
     case "approve_booking":
       return roles.some(r => roleHasMinRank(r, "APPROVER"));

@@ -21,7 +21,7 @@ import {
   canPerformAction,
   type BookingAction,
 } from "../auth/authorization";
-import { ServerAuthzClient, ServerAuthzError } from "../auth/serverAuthzClient";
+import { ServerAuthzError, resolveAuthzBaseUrl, createServerAuthzClient, authorizeServerAction } from "../auth/serverAuthzClient";
 import { canRunDemoOnlyOperation, assertDemoOnlyOperation, assertProviderNotLiveForDemoOperation, getStateResetOnModeSwitch, isKnownMode } from "../safety/modeGuards";
 import { emitAuditEvent, snapshotBooking, type AuditAction } from "../audit/auditTrail";
 import { getTenantTimezone, toTenantLocalParts, toIsoFromTenantParts, formatTenantDateTime } from "../config/tenantTimezone";
@@ -30,7 +30,7 @@ import { validateResolvedBooking, type BookingDataQuality } from "../data/bookin
 import { ErrorBoundary } from "./errorBoundary";
 
 const TENANT = import.meta.env.VITE_GEOTAB_DATABASE || "opex_trial";
-const AUTHZ_API_BASE_URL = import.meta.env.VITE_AUTHZ_API_BASE_URL || "";
+const AUTHZ_API_BASE_URL = resolveAuthzBaseUrl(import.meta.env);
 
 type GeotabApi = {
   call?: (method: string, params: Record<string, unknown>, success: (result: unknown) => void, error?: (error: unknown) => void) => void;
@@ -2144,10 +2144,7 @@ export default function App() {
   const identityResolveSeq = useRef(0);
 
   // Server-side authorization client (created once, reused across renders)
-  const serverAuthz = useMemo(() => {
-    if (!AUTHZ_API_BASE_URL) return null;
-    return new ServerAuthzClient({ baseUrl: AUTHZ_API_BASE_URL });
-  }, [AUTHZ_API_BASE_URL]);
+  const serverAuthz = useMemo(() => createServerAuthzClient(AUTHZ_API_BASE_URL), [AUTHZ_API_BASE_URL]);
 
   // Keep refs in sync with state
   useEffect(() => {
@@ -2248,7 +2245,7 @@ export default function App() {
 
       const effectiveMode = isKnownMode(mode) ? mode : "DEMO";
       const dataProvider: BookingDataProvider = effectiveMode === "ADDIN_DATA"
-        ? createAddInDataProvider(geotabApi, addInId)
+        ? createAddInDataProvider(geotabApi, addInId, serverAuthz)
         : bookingDataProvider;
 
       const loadMasterData = async () => {
@@ -2323,15 +2320,16 @@ export default function App() {
 
   const provider = useMemo(() => {
     // Fail closed: only explicit DEMO uses local demo provider; only explicit ADDIN_DATA uses live provider.
-    if (mode === "ADDIN_DATA") {
-      return createAddInDataProvider(geotabApi, addInId);
+    const p = mode === "ADDIN_DATA"
+      ? createAddInDataProvider(geotabApi, addInId, serverAuthz)
+      : bookingDataProvider;
+    // Wire session credentials into the live provider so protected writes route through the Worker.
+    if (mode === "ADDIN_DATA" && p && typeof (p as any).setCredentials === "function") {
+      const creds = getSessionCredentials(mode, identityState);
+      (p as any).setCredentials(creds);
     }
-    if (mode === "DEMO") {
-      return bookingDataProvider;
-    }
-    // Ambiguous mode: do not select live provider; return local provider but operations remain guarded/fail-closed elsewhere.
-    return bookingDataProvider;
-  }, [mode, geotabApi, addInId]);
+    return p;
+  }, [mode, geotabApi, addInId, serverAuthz, identityState]);
 
   const notificationEngine = useMemo(() => {
     return createNotificationEngine(provider as NotificationDataProvider, provider);
@@ -2366,16 +2364,7 @@ export default function App() {
   const updateBookingStatus = useCallback(async (id: string, newStatus: string, expectedVersion: number, action: BookingAction, approverId?: string, approvalRemarks?: string) => {
     /* Server-side authorization gate: verify session and enforce RBAC before any write */
     const creds = getSessionCredentials(mode, identityState);
-    if (!creds || !serverAuthz) {
-      if (mode === "ADDIN_DATA") {
-        throw new Error("SERVER_AUTHZ_NOT_CONFIGURED");
-      }
-    } else {
-      const authz = await serverAuthz.authorize(creds.sessionId, creds.database, creds.server, action, id);
-      if (!authz.authorized) {
-        throw new Error(`NOT_AUTHORIZED: ${authz.error}`);
-      }
-    }
+    await authorizeServerAction({ serverAuthz, mode, creds, action, bookingId: id });
 
     await provider.updateBookingStatus(id, newStatus, expectedVersion, approverId, approvalRemarks);
     const updated = await provider.getBookings();
@@ -2614,7 +2603,7 @@ export default function App() {
     /* Server-side authorization gate for booking creation */
     const createCreds = getSessionCredentials(mode, identityState);
     if (createCreds && serverAuthz) {
-      const createAuthz = await serverAuthz.authorize(createCreds.sessionId, createCreds.database, createCreds.server, "create_booking");
+      const createAuthz = await serverAuthz.authorize(createCreds.sessionId, createCreds.database, createCreds.server, "create_booking", undefined, createCreds.userName);
       if (!createAuthz.authorized) {
         setMessage({ type: "error", text: `Not authorized to create bookings (requires ${createAuthz.requiredRole ?? "EMPLOYEE"} role).` });
         return;
@@ -3073,7 +3062,7 @@ export default function App() {
           unreadCount={unreadCount}
           onMarkAsRead={async (id: string) => {
             if (notificationEngine && actorId) {
-              await notificationEngine.markAsRead(id);
+              await notificationEngine.markAsRead(id, actorId);
               const ns = await notificationEngine.getNotificationsForUser(actorId);
               setNotifications(ns);
               setUnreadCount(ns.filter(n => !n.is_read).length);
@@ -3081,7 +3070,7 @@ export default function App() {
           }}
           onMarkAllAsRead={async () => {
             if (notificationEngine && actorId) {
-              await notificationEngine.markAllAsRead(actorId);
+              await notificationEngine.markAllAsRead(actorId, actorId);
               const ns = await notificationEngine.getNotificationsForUser(actorId);
               setNotifications(ns);
               setUnreadCount(0);
@@ -3093,7 +3082,7 @@ export default function App() {
               setSelectedBooking(bookings.find(b => b.id === n.related_booking_id) || null);
               setActive("My Bookings");
               if (notificationEngine && actorId) {
-                await notificationEngine.markAsRead(id);
+                await notificationEngine.markAsRead(id, actorId);
                 const ns = await notificationEngine.getNotificationsForUser(actorId);
                 setNotifications(ns);
                 setUnreadCount(ns.filter(x => !x.is_read).length);
@@ -3291,7 +3280,7 @@ export default function App() {
                   unreadCount={unreadCount}
                   onMarkAsRead={async (id: string) => {
                     if (notificationEngine && actorId) {
-                      await notificationEngine.markAsRead(id);
+                      await notificationEngine.markAsRead(id, actorId);
                       const ns = await notificationEngine.getNotificationsForUser(actorId);
                       setNotifications(ns);
                       setUnreadCount(ns.filter(n => !n.is_read).length);
@@ -3299,7 +3288,7 @@ export default function App() {
                   }}
                   onMarkAllAsRead={async () => {
                     if (notificationEngine && actorId) {
-                      await notificationEngine.markAllAsRead(actorId);
+                      await notificationEngine.markAllAsRead(actorId, actorId);
                       const ns = await notificationEngine.getNotificationsForUser(actorId);
                       setNotifications(ns);
                       setUnreadCount(0);
@@ -3314,7 +3303,7 @@ export default function App() {
                       setActive("My Bookings");
                       setNotificationDropdownOpen(false);
                       if (notificationEngine && actorId) {
-                        await notificationEngine.markAsRead(id);
+                        await notificationEngine.markAsRead(id, actorId);
                         const ns = await notificationEngine.getNotificationsForUser(actorId);
                         setNotifications(ns);
                         setUnreadCount(ns.filter(x => !x.is_read).length);

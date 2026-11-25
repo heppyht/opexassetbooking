@@ -14,9 +14,12 @@ import type {
   NotificationDataProvider,
   OpexNotification,
   OpexBookingAudit,
+  OpexBookingAuditV2,
   OpexAuditPending,
   OpexAuditDeadLetter,
   NotificationType,
+  CanonicalAuditInput,
+  NormalizedAuditEvent,
 } from "./types";
 import { SCHEMA_VERSION, generateBusinessId } from "./types.ts";
 import {
@@ -28,6 +31,7 @@ import {
   mockOpexBookings,
 } from "./mockMyGeotab.ts";
 import { validateResolvedBooking } from "./bookingValidation.ts";
+import { buildBookingAuditEvent, generateCanonicalAuditKey, normalizeAuditRecord } from "./auditEvent.ts";
 
 const MAX_RETRIES = 5;
 
@@ -140,6 +144,7 @@ export class LocalBookingDataProvider implements BookingDataProvider, Notificati
   private bookings: OpexBooking[];
   private notifications: OpexNotification[];
   private auditRecords: OpexBookingAudit[];
+  private canonicalAuditRecords: OpexBookingAuditV2[];
   private pendingAuditRecords: OpexAuditPending[];
   private deadLetterRecords: OpexAuditDeadLetter[];
 
@@ -152,6 +157,7 @@ export class LocalBookingDataProvider implements BookingDataProvider, Notificati
     this.bookings = [...mockOpexBookings];
     this.notifications = [];
     this.auditRecords = [];
+    this.canonicalAuditRecords = [];
     this.pendingAuditRecords = [];
     this.deadLetterRecords = [];
   }
@@ -255,6 +261,7 @@ export class LocalBookingDataProvider implements BookingDataProvider, Notificati
     this.bookings = [...mockOpexBookings];
     this.notifications = [];
     this.auditRecords = [];
+    this.canonicalAuditRecords = [];
     this.pendingAuditRecords = [];
   }
 
@@ -314,13 +321,19 @@ export class LocalBookingDataProvider implements BookingDataProvider, Notificati
     return found ?? null;
   }
 
-  async markAsRead(notificationId: string): Promise<void> {
+  async markAsRead(notificationId: string, actorUserId: string): Promise<void> {
     const idx = this.notifications.findIndex(n => n.id === notificationId);
     if (idx === -1) return;
+    /* Mandatory actor validation: fail closed when the actor is missing/blank
+       or does not own the notification. */
+    if (!actorUserId || !actorUserId.trim() || this.notifications[idx].recipient_user_id !== actorUserId) return;
     this.notifications[idx] = { ...this.notifications[idx], is_read: true, updated_at: new Date().toISOString() };
   }
 
-  async markAllAsRead(userId: string): Promise<void> {
+  async markAllAsRead(userId: string, actorUserId: string): Promise<void> {
+    /* Mandatory actor validation: only the verified actor may mark their own
+       notifications as read. */
+    if (!actorUserId || !actorUserId.trim() || userId !== actorUserId) return;
     const now = new Date().toISOString();
     this.notifications = this.notifications.map(n =>
       n.recipient_user_id === userId && !n.is_read
@@ -329,9 +342,12 @@ export class LocalBookingDataProvider implements BookingDataProvider, Notificati
     );
   }
 
-  async markDeliveryStatus(notificationId: string, status: "pending" | "delivered" | "failed"): Promise<void> {
+  async markDeliveryStatus(notificationId: string, status: "pending" | "delivered" | "failed", actorUserId: string): Promise<void> {
     const idx = this.notifications.findIndex(n => n.id === notificationId);
     if (idx === -1) return;
+    /* Mandatory actor validation: fail closed when the actor is missing/blank
+       or does not own the notification. */
+    if (!actorUserId || !actorUserId.trim() || this.notifications[idx].recipient_user_id !== actorUserId) return;
     this.notifications[idx] = {
       ...this.notifications[idx],
       delivery_status: status,
@@ -365,10 +381,53 @@ export class LocalBookingDataProvider implements BookingDataProvider, Notificati
     this.auditRecords.push(record);
   }
 
-  async getAuditRecords(bookingId: string): Promise<OpexBookingAudit[]> {
-    return this.auditRecords
-      .filter(r => r.booking_id === bookingId)
-      .sort((a, b) => new Date(b.created_at).getTime() - new Date(a.created_at).getTime());
+  async createBookingAuditEvent(input: CanonicalAuditInput): Promise<void> {
+    const event: OpexBookingAuditV2 = {
+      recordType: "bookingAudit",
+      schemaVersion: SCHEMA_VERSION,
+      auditKey: input.auditKey ?? generateCanonicalAuditKey(),
+      bookingKey: input.bookingKey,
+      action: input.action,
+      actor: input.actor,
+      occurredAtUtc: input.occurredAtUtc ?? new Date().toISOString(),
+      previousStatus: input.previousStatus ?? null,
+      newStatus: input.newStatus ?? null,
+      changes: input.changes,
+      metadata: input.metadata,
+    };
+    this.canonicalAuditRecords.push(event);
+  }
+
+  async getAuditRecords(bookingId: string): Promise<NormalizedAuditEvent[]> {
+    const normalized: NormalizedAuditEvent[] = [];
+    for (const r of this.auditRecords) {
+      if (r.booking_id !== bookingId) continue;
+      normalized.push({
+        recordType: "booking_audit",
+        schemaVersion: r.schemaVersion,
+        id: r.id,
+        auditKey: undefined,
+        bookingKey: r.booking_id,
+        action: r.action,
+        actor: { userId: r.actor_user_id, userName: undefined, role: undefined },
+        occurredAtUtc: r.created_at,
+        previousStatus: r.previous_status,
+        newStatus: r.new_status,
+        changes: null,
+        metadata: null,
+        sourceFormat: "legacy",
+      });
+    }
+    for (const r of this.canonicalAuditRecords) {
+      if (r.bookingKey !== bookingId) continue;
+      const n = normalizeAuditRecord(r, r.auditKey);
+      if (n) normalized.push(n);
+    }
+    return normalized.sort((a, b) => {
+      const da = a.occurredAtUtc ? new Date(a.occurredAtUtc).getTime() : 0;
+      const db = b.occurredAtUtc ? new Date(b.occurredAtUtc).getTime() : 0;
+      return db - da;
+    });
   }
 
   async createAuditPending(input: Omit<OpexAuditPending, "id" | "schemaVersion" | "recordType" | "created_at" | "retry_count" | "next_retry_at">): Promise<OpexAuditPending> {
