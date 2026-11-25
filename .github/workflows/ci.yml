@@ -23,19 +23,22 @@ jobs:
           cache: npm
 
       - name: Install dependencies
-        run: npm install
+        run: npm ci
 
-      - name: TypeScript validation
+      - name: Web TypeScript validation
         run: npx tsc -p apps/web/tsconfig.json --noEmit
 
-      - name: Application tests
+      - name: API TypeScript validation
+        run: npm --workspace apps/api run typecheck
+
+      - name: Web application and provider-contract tests
         run: npm test
 
-      - name: Web regression tests
-        run: npm --workspace apps/web run test
+      - name: API Worker tests
+        run: npm --workspace apps/api run test
 
-      - name: Service Add-In tests
-        run: node --experimental-strip-types apps/web/test/service-addin.test.mjs
+      - name: Service Add-In build
+        run: npm --workspace apps/web run build:service
 
       - name: Production build
         run: npm --workspace apps/web run build

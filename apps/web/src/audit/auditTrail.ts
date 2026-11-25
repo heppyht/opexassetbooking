@@ -1,16 +1,27 @@
-﻿import type { BookingDataProvider, NotificationDataProvider, OpexAuditDeadLetter, OpexAuditPending, OpexBookingAudit, AuditReconciliationResult, ResolvedBooking } from "../data/types";
+﻿import type {
+  BookingDataProvider,
+  NotificationDataProvider,
+  OpexAuditDeadLetter,
+  OpexAuditPending,
+  OpexBookingAudit,
+  OpexBookingAuditV2,
+  CanonicalAuditInput,
+  ActorInfo,
+  BookingAction,
+  AuditReconciliationResult,
+  ResolvedBooking,
+  NormalizedAuditEvent,
+} from "../data/types";
 import type { AppMode } from "../auth/identityResolver";
 import type { IdentityResolutionState } from "../auth/identityResolver";
 
-export type AuditAction =
-  | "BOOKING_CREATED"
-  | "BOOKING_UPDATED"
-  | "BOOKING_APPROVED"
-  | "BOOKING_REJECTED"
-  | "VEHICLE_ASSIGNED"
-  | "DRIVER_ASSIGNED"
-  | "BOOKING_COMPLETED"
-  | "BOOKING_CANCELLED";
+/* The normalization layer (normalizeAuditRecord, isCanonicalAudit) lives in
+   ../data/types.ts and is imported directly by UI-side modules. The standalone
+   Service Add-In bundle inlines its own copy (see serviceAddin.ts) so that
+   this module has no runtime value import from types.ts, keeping the
+   standalone --module ESNext build valid without allowImportingTsExtensions. */
+
+export type AuditAction = BookingAction;
 
 export type AuditFieldSnapshot = {
   status?: string | null;
@@ -217,6 +228,25 @@ export async function recoverAuditPending(
       continue;
     }
     try {
+      /* Skip recovery if a canonical audit already exists for this
+         booking+action+actor. This prevents duplicate audit records when the
+         original write succeeded but the response was lost (crash window).
+         Canonical audits are written by emitAuditEvent after Worker booking
+         confirmation; legacy pending audits are only a fallback. */
+      const existingAudits = await provider.getAuditRecords?.(pending.booking_id);
+      const alreadyAudited = existingAudits?.some(
+        a => a.sourceFormat === "canonical"
+          && a.action === pending.action
+          && a.actor.userId === pending.actor_user_id,
+      );
+      if (alreadyAudited) {
+        await provider.deleteAuditPending(pending.id);
+        pendingQueue = pendingQueue.filter(p => p.id !== pending.id);
+        recovered += 1;
+        totalRecovered += 1;
+        continue;
+      }
+
       await createAuditRecord.call(provider, {
         booking_id: pending.booking_id,
         action: pending.action,
@@ -323,50 +353,97 @@ export function resetAuditQueueForTests() {
   recentKeys.clear();
 }
 
+/* Compute only the fields that actually changed between previous and next
+   snapshots, mirroring auditEvent.computeChanges but kept local so this
+   module has no runtime value imports (it is dynamically imported by the
+   standalone Service Add-In build). */
+function auditFieldChanges(previous: Record<string, unknown> | null | undefined, next: Record<string, unknown> | null | undefined): Record<string, { from: unknown; to: unknown }> {
+  const changed: Record<string, { from: unknown; to: unknown }> = {};
+  const keys: string[] = ["status", "startAt", "endAt", "destination", "purpose", "assetId", "driverId"];
+  for (const k of keys) {
+    const p = previous?.[k] ?? null;
+    const n = next?.[k] ?? null;
+    if (p !== n) {
+      changed[k] = { from: p, to: n };
+    }
+  }
+  return changed;
+}
+
 /*───────────────────── Audit event emission (with retry queue) ─────────────────────*/
 
 export async function emitAuditEvent(input: AuditEmitInput): Promise<AuditEmitResult> {
-  const { mode, provider, entityId, action, actorUserId, identity } = input;
-  if (!entityId || !action || !actorUserId) {
+  const { mode, provider, entityId, action, actorUserId, identity, previousStatus, newStatus, previous, next, metadata, idempotencyKey } = input;
+  if (!entityId || !action) {
     return { ok: false, error: "AUDIT_INVALID_INPUT" };
   }
-  /* Validate actor identity against the authenticated principal.
-     A caller cannot audit an action on behalf of another user. */
+  /* Derive actor identity from the verified MyGeotab principal (server-side).
+     Never trust browser-provided userId/userName/role. Fail closed for
+     protected LIVE operations when the actor cannot be verified. */
+  let actor: ActorInfo;
   if (identity && identity.status === "authenticated") {
-    if (actorUserId.trim() !== identity.principal.id.trim()) {
-      return { ok: false, error: "AUDIT_ACTOR_MISMATCH" };
-    }
+    /* Derive actor identity from the verified MyGeotab principal. A
+       caller-supplied actorUserId is never allowed to override the verified
+       principal; it is ignored for LIVE authenticated operations. */
+    actor = {
+      userId: identity.principal.id,
+      ...(identity.principal.name ? { userName: identity.principal.name } : {}),
+      ...(identity.principal.roles?.[0] ? { role: identity.principal.roles[0] } : {}),
+    };
+  } else if (mode === "DEMO") {
+    actor = actorUserId ? { userId: actorUserId } : { userId: "demo-actor" };
+  } else {
+    return { ok: false, error: "AUDIT_ACTOR_UNVERIFIED" };
   }
-  const createAuditRecord = provider.createAuditRecord;
-  if (typeof createAuditRecord !== "function") {
+  const createBookingAuditEvent = provider.createBookingAuditEvent;
+  if (typeof createBookingAuditEvent !== "function") {
     return { ok: false, error: "AUDIT_PROVIDER_UNAVAILABLE" };
   }
 
-  const idem = input.idempotencyKey || `${mode}:${entityId}:${action}:${input.previousStatus ?? ""}:${input.newStatus ?? ""}:${actorUserId}:${safeJson(input.metadata ?? null)}`;
+  const idem = idempotencyKey ?? `${mode}:${entityId}:${action}:${previousStatus ?? ""}:${newStatus ?? ""}:${actor.userId}:${safeJson(metadata ?? null)}`;
   if (recentKeys.has(idem)) {
     return { ok: true, deduped: true };
   }
 
-  const details = safeJson({
-    entityType: "BOOKING",
-    entityId,
-    mode,
-    previous: input.previous ?? null,
-    new: input.next ?? null,
-    changed: diffRelevantFields(input.previous, input.next),
-    metadata: input.metadata ?? null,
-    idempotencyKey: idem,
-  });
+  /* Cross-session dedup: check if a canonical audit record with this auditKey
+     already exists in AddInData. Survives page reloads (unlike recentKeys).
+     AddInData has no atomic compare-and-set, so this is best-effort — two
+     concurrent requests could both read "none exists" and both write. That
+     race is unavoidable with the current platform; reconciliation detects
+     duplicates via DUPLICATE_AUDIT_EVENT findings. */
+  try {
+    const existingAudits = await provider.getAuditRecords?.(entityId);
+    const alreadyExists = existingAudits?.some(
+      (a) => a.sourceFormat === "canonical" && a.auditKey === idem,
+    );
+    if (alreadyExists) {
+      recentKeys.add(idem);
+      return { ok: true, deduped: true };
+    }
+  } catch {
+    /* Dedup check failed — proceed with the write rather than blocking a
+       legitimate audit event. The pending-audit queue handles write failures. */
+  }
+
+  const changes = auditFieldChanges(previous, next);
+  const canonicalInput: CanonicalAuditInput = {
+    auditKey: idem,
+    bookingKey: entityId,
+    action: action as BookingAction,
+    actor,
+    occurredAtUtc: new Date().toISOString(),
+    previousStatus: previousStatus ?? null,
+    newStatus: newStatus ?? null,
+    changes,
+    metadata: {
+      ...(metadata && typeof metadata === "object" ? metadata : {}),
+      source: typeof metadata?.source === "string" ? metadata.source : "ui.auditTrail",
+      mode,
+    },
+  };
 
   try {
-    await createAuditRecord.call(provider, {
-      booking_id: entityId,
-      action,
-      actor_user_id: actorUserId,
-      previous_status: input.previousStatus ?? input.previous?.status ?? null,
-      new_status: input.newStatus ?? input.next?.status ?? null,
-      details,
-    });
+    await createBookingAuditEvent.call(provider, canonicalInput);
     recentKeys.add(idem);
 
     /* Attempt to recover any previously pending audit records after a successful write. */
@@ -377,7 +454,7 @@ export async function emitAuditEvent(input: AuditEmitInput): Promise<AuditEmitRe
   } catch (e) {
     const errorMsg = e instanceof Error ? e.message : "AUDIT_WRITE_FAILED";
     const notifProvider = provider as NotificationDataProvider;
-    await queueAuditPending(notifProvider, input, actorUserId, errorMsg);
+    await queueAuditPending(notifProvider, input, actor.userId, errorMsg);
     return { ok: false, error: errorMsg };
   }
 }
@@ -504,6 +581,7 @@ export function findingSeverity(findingType: ReconciliationFindingType): Reconci
     case "INVALID_ACTOR_ATTRIBUTION":
     case "RECORD_MODIFIED_WITHOUT_AUDIT":
     case "DUPLICATE_BOOKING_RECORD":
+    case "DUPLICATE_AUDIT_EVENT":
       return "HIGH";
     case "UNEXPECTED_STATUS_TRANSITION":
     case "RECORD_DELETED_WITHOUT_AUDIT":
@@ -578,18 +656,23 @@ export interface EnhancedReconciliationFinding {
    and version history. Returns structured findings for each anomaly detected. */
 export function reconcileAuditEnhanced(
   bookings: ResolvedBooking[],
-  audits: OpexBookingAudit[],
+  audits: NormalizedAuditEvent[],
   notifications: { id: string; booking_id: string; actor_user_id: string; created_at: string; type: string }[],
 ): EnhancedReconciliationFinding[] {
   const findings: EnhancedReconciliationFinding[] = [];
   const now = new Date().toISOString();
 
-  /* Build audit lookup by booking ID */
-  const auditByBooking = new Map<string, OpexBookingAudit[]>();
+  /* Build audit lookup by booking key. Both legacy ("booking_audit") and
+     canonical ("bookingAudit") records are normalized into a common shape
+     before reaching this function, so a single lookup works for both. */
+  const auditByBooking = new Map<string, NormalizedAuditEvent[]>();
   for (const audit of audits) {
-    const existing = auditByBooking.get(audit.booking_id) ?? [];
+    if (!audit || typeof audit !== "object") continue;
+    const bk = audit.bookingKey;
+    if (typeof bk !== "string") continue;
+    const existing = auditByBooking.get(bk) ?? [];
     existing.push(audit);
-    auditByBooking.set(audit.booking_id, existing);
+    auditByBooking.set(bk, existing);
   }
 
   /* Build notification lookup by booking ID */
@@ -611,9 +694,11 @@ export function reconcileAuditEnhanced(
     const notificationsForBooking = notificationByBooking.get(booking.id) ?? [];
 
     /* Sort audits by timestamp descending */
-    const sortedAudits = [...auditsForBooking].sort(
-      (a, b) => new Date(b.created_at).getTime() - new Date(a.created_at).getTime(),
-    );
+    const sortedAudits = [...auditsForBooking].sort((a, b) => {
+      const ta = a.occurredAtUtc ? new Date(a.occurredAtUtc).getTime() : 0;
+      const tb = b.occurredAtUtc ? new Date(b.occurredAtUtc).getTime() : 0;
+      return tb - ta;
+    });
     const lastAudit = sortedAudits.length > 0 ? sortedAudits[0] : null;
 
     /* 1. Missing audit events */
@@ -622,7 +707,7 @@ export function reconcileAuditEnhanced(
       expected => !auditsForBooking.some(a => a.action === expected),
     );
     if (missingActions.length > 0) {
-      const hasValidActor = lastAudit ? lastAudit.actor_user_id === booking.requester_id : false;
+      const hasValidActor = lastAudit ? lastAudit.actor.userId === booking.requester_id : false;
       const classification = classifyEvidence(
         "MISSING_AUDIT_EVENT",
         hasValidActor,
@@ -648,8 +733,8 @@ export function reconcileAuditEnhanced(
     for (let i = 1; i < sortedAudits.length; i++) {
       const prev = sortedAudits[i - 1];
       const curr = sortedAudits[i];
-      const prevStatus = prev.new_status ?? prev.previous_status;
-      const currStatus = curr.new_status ?? curr.previous_status;
+      const prevStatus = prev.newStatus ?? prev.previousStatus;
+      const currStatus = curr.newStatus ?? curr.previousStatus;
       if (prevStatus && currStatus) {
         const allowed = VALID_TRANSITIONS[prevStatus];
         if (allowed && !allowed.includes(currStatus)) {
@@ -659,13 +744,13 @@ export function reconcileAuditEnhanced(
             finding_type: "UNEXPECTED_STATUS_TRANSITION",
             severity: findingSeverity("UNEXPECTED_STATUS_TRANSITION"),
             expected_state: `Valid transitions from ${prevStatus}: ${allowed.join(", ")}`,
-            observed_state: `Transition ${prevStatus} -> ${currStatus} at ${curr.created_at}`,
+            observed_state: `Transition ${prevStatus} -> ${currStatus} at ${curr.occurredAtUtc}`,
             detection_timestamp: now,
             related_audit_references: [prev.id, curr.id],
             reconciliation_status: "OPEN",
             evidence_classification: classifyEvidence(
               "UNEXPECTED_STATUS_TRANSITION",
-              curr.actor_user_id === booking.requester_id,
+              curr.actor.userId === booking.requester_id,
               false,
               true,
             ),
@@ -677,7 +762,7 @@ export function reconcileAuditEnhanced(
 
     /* 3. Invalid actor attribution (audit actor doesn't match booking requester) */
     for (const audit of sortedAudits) {
-      if (audit.actor_user_id && audit.actor_user_id !== booking.requester_id) {
+      if (audit.actor.userId && audit.actor.userId !== booking.requester_id) {
         /* Allow approver to act on behalf of requester for approval actions */
         const isApprovalAction = audit.action === "BOOKING_APPROVED" || audit.action === "BOOKING_REJECTED";
         const isDriverAssignment = audit.action === "VEHICLE_ASSIGNED" || audit.action === "DRIVER_ASSIGNED";
@@ -688,7 +773,7 @@ export function reconcileAuditEnhanced(
             finding_type: "INVALID_ACTOR_ATTRIBUTION",
             severity: findingSeverity("INVALID_ACTOR_ATTRIBUTION"),
             expected_state: `Actor should be ${booking.requester_id} (booking requester)`,
-            observed_state: `Actor recorded as ${audit.actor_user_id} in audit ${audit.id}`,
+            observed_state: `Actor recorded as ${audit.actor.userId} in audit ${audit.id}`,
             detection_timestamp: now,
             related_audit_references: [audit.id],
             reconciliation_status: "OPEN",
@@ -698,7 +783,7 @@ export function reconcileAuditEnhanced(
               true,
               true,
             ),
-            notes: `Audit record ${audit.id} has actor ${audit.actor_user_id} that does not match booking requester ${booking.requester_id}`,
+            notes: `Audit record ${audit.id} has actor ${audit.actor.userId} that does not match booking requester ${booking.requester_id}`,
           });
         }
       }
@@ -777,14 +862,16 @@ export function reconcileAuditEnhanced(
   /* 7. Detect bookings with audit records but no corresponding booking (orphaned audits) */
   const bookingIds = new Set(bookings.map(b => b.id));
   for (const audit of audits) {
-    if (!bookingIds.has(audit.booking_id)) {
+    if (!audit || typeof audit !== "object") continue;
+    const bk = audit.bookingKey ?? "";
+    if (!bookingIds.has(bk)) {
       findings.push({
-        finding_id: generateFindingId(audit.booking_id, "RECORD_DELETED_WITHOUT_AUDIT", `${now}:${audit.id}`),
-        booking_id: audit.booking_id,
+        finding_id: generateFindingId(bk, "RECORD_DELETED_WITHOUT_AUDIT", `${now}:${audit.id}`),
+        booking_id: bk,
         finding_type: "RECORD_DELETED_WITHOUT_AUDIT",
         severity: findingSeverity("RECORD_DELETED_WITHOUT_AUDIT"),
         expected_state: "Booking record should exist for audit record",
-        observed_state: `Audit record ${audit.id} exists for booking ${audit.booking_id} but no booking record found`,
+        observed_state: `Audit record ${audit.id} exists for booking ${audit.bookingKey} but no booking record found`,
         detection_timestamp: now,
         related_audit_references: [audit.id],
         reconciliation_status: "OPEN",
@@ -794,7 +881,43 @@ export function reconcileAuditEnhanced(
           false,
           true,
         ),
-        notes: `Orphaned audit record ${audit.id} references deleted or missing booking ${audit.booking_id}`,
+        notes: `Orphaned audit record ${audit.id} references deleted or missing booking ${audit.bookingKey} but no booking record found`,
+      });
+    }
+  }
+
+  /* 7b. Detect duplicate canonical audit events (same auditKey emitted more
+     than once). Duplicate audit keys indicate a repeated logical write and
+     are flagged for review — they are not deleted or overwritten. */
+  const auditKeyCounts = new Map<string, NormalizedAuditEvent[]>();
+  for (const audit of audits) {
+    if (!audit || typeof audit !== "object") continue;
+    if (audit.sourceFormat === "canonical" && audit.auditKey) {
+      const existing = auditKeyCounts.get(audit.auditKey) ?? [];
+      existing.push(audit);
+      auditKeyCounts.set(audit.auditKey, existing);
+    }
+  }
+  for (const [auditKey, duplicates] of auditKeyCounts) {
+    if (duplicates.length > 1) {
+      const bookingId = duplicates[0].bookingKey ?? "";
+      findings.push({
+        finding_id: generateFindingId(bookingId, "DUPLICATE_AUDIT_EVENT", `${now}:${auditKey}`),
+        booking_id: bookingId,
+        finding_type: "DUPLICATE_AUDIT_EVENT",
+        severity: findingSeverity("DUPLICATE_AUDIT_EVENT"),
+        expected_state: "Single audit event per auditKey",
+        observed_state: `${duplicates.length} audit records share auditKey ${auditKey}`,
+        detection_timestamp: now,
+        related_audit_references: duplicates.map(d => d.id),
+        reconciliation_status: "OPEN",
+        evidence_classification: classifyEvidence(
+          "DUPLICATE_AUDIT_EVENT",
+          true,
+          true,
+          true,
+        ),
+        notes: `Duplicate canonical audit event auditKey ${auditKey} has ${duplicates.length} records`,
       });
     }
   }

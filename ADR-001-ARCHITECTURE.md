@@ -29,55 +29,137 @@ Phase 6 implemented a trusted server-side authorization layer (Cloudflare Worker
 
 ```
 Client (React Add-In, GitHub Pages)
-├── GET bookings → AddInData (direct read, no authz gate needed for reads)
-├── Protected write (approve/reject/assign/complete/cancel/create)
+├── GET bookings/assets/users → AddInData (direct read, bounded queries)
+├── Protected write (create_booking)
 │   └── POST /authz/execute → Cloudflare Worker (Hono)
 │       ├─ Verify sessionId → MyGeotab Get User API
 │       ├─ Check roles → MyGeotab User record
 │       ├─ Enforce RBAC (server-side)
+│       ├─ SHA-256 payload fingerprint → computePayloadFingerprint
+│       ├─ Idempotency key check → checkIdempotencyKey
 │       ├─ Write booking → AddInData (service account)
-│       └─ Write audit → AddInData (service account)
+│       └─ Store idempotency key → AddInData (service account)
+│   → Frontend emits canonical audit event (bookingAudit)
+├── Protected write (update_booking_status: approve/reject/assign/complete/cancel)
+│   └── POST /authz/execute → Cloudflare Worker (Hono)
+│       ├─ Same security pipeline as create_booking
+│       ├─ Write booking update → AddInData (service account, Set operation)
+│       └─ Store idempotency key → AddInData (service account)
+│   → Frontend emits canonical audit event (bookingAudit)
+├── Protected write (delete_booking)
+│   └── POST /authz/execute → Cloudflare Worker (Hono)
+│       ├─ Same security pipeline
+│       ├─ Remove booking → AddInData (service account, Remove operation)
+│       └─ Store idempotency key → AddInData (service account)
+│   → Frontend emits canonical audit event (bookingAudit)
+├── Audit writes (bookingAudit) → AddInData (frontend, direct — internal system write)
+├── Notification writes → AddInData (frontend, direct — internal system write)
+└── Read operations → AddInData (direct, no authz gate needed)
 ```
-
-### Alternatives Considered
-
-| Alternative | Pros | Cons | Decision |
-|---|---|---|---|
-| Client-side RBAC only (Phase 5) | Simple, no backend | Bypassable via browser console | ❌ Rejected |
-| Full PostgreSQL backend (Phase 3 architecture) | Full server-side control | Contradicts native-only design goal | ❌ Rejected |
-| Trusted authorization Worker + AddInData | Server-side authz, AddInData storage | Direct AddInData bypass still possible | ✅ Selected |
-| Service Add-In reconciliation | Detects/tamper-proofs direct writes | Additional infrastructure, future work | ⚠️ Recommended follow-up |
-| OAuth2/OIDC federation | Standard identity protocol | MyGeotab Add-In doesn't support external IdP | ❌ Not supported |
 
 ## Consequences
 
 ### Positive
-- Server-side authorization enforcement for all UI-initiated protected operations
+- Server-side authorization enforcement for all UI-initiated protected booking operations (create, update, delete)
+- SHA-256 payload fingerprint verification prevents payload tampering
+- Server-side idempotency keys prevent duplicate writes under the same key
 - Verified actor attribution in audit records (not spoofed client IDs)
 - AddInData remains the sole persistent storage (no PostgreSQL)
 - Service account credentials managed as Cloudflare secrets (not in frontend)
 - CORS restricted to frontend origin only
 
 ### Negative
-- Direct AddInData writes from browser console cannot be prevented at platform level
+- Direct AddInData writes from browser console cannot be prevented at platform level (T1 residual risk)
+- Audit writes occur from the frontend after Worker confirmation; if frontend crashes between Worker success and audit write, reconciliation detects MISSING_AUDIT_EVENT
 - Additional infrastructure dependency (Cloudflare Worker)
 - Service account session management (14-day expiry, auto-refresh)
 - Client must be online to perform protected operations (no offline mode)
+- Two AddInData queries per reconciliation run for dual-format audit support
 
 ### Neutral
 - Read operations remain client-direct for performance
+- Audit/notification/recovery writes remain frontend-direct (internal system writes, not user-facing business writes)
 - Demo mode unchanged (in-memory, no server dependency)
 
-## Rationale
+### Audit Event Canonicalization (Phase 24.5)
 
-MyGeotab AddInData is a client-side storage API with no server-side authorization middleware. Custom security identifiers in `configuration.json` control Add-In menu visibility, not AddInData API permissions. The trusted authorization Worker is the best available approach within the constraints of the native-only architecture.
+Audit events are stored as canonical `bookingAudit` records (`recordType: "bookingAudit"`, `schemaVersion: 1`) in AddInData:
+- `auditKey`: unique identifier per event (immutable, append-only).
+- `bookingKey`: reference to the associated booking (no full booking copy).
+- `action`: standardized business event name.
+- `actor`: `{ userId, userName?, role? }` derived from the verified MyGeotab principal at write time; browser-provided identity never trusted.
+- `occurredAtUtc`: ISO 8601 UTC timestamp (stored source of truth).
+- `previousStatus` / `newStatus`: actual status transition.
+- `changes`: only fields that changed, each with `from`/`to`; `null` when the field did not previously exist.
+- `metadata`: minimal `{ source, mode }`; no session IDs or credentials.
 
-## Implementation Notes
+Legacy `booking_audit` records remain readable via a normalization layer and are never rewritten or deleted. Reconciliation recognizes both formats.
 
-- Service account must be configured in MyGeotab `opex_trial` with ManageAddInData clearance
-- Service account credentials set via `wrangler secret put` (never in `.dev.vars` or code)
-- `VITE_AUTHZ_API_BASE_URL` set in frontend environment
-- All AddInData writes go through the service account; the client never writes protected operations directly
+### Audit Reconciliation Dual-Format Support (Phase 24.5.1)
+
+The Service Add-In reconciliation loop (`runReconciliation`) retrieves both audit formats using two separate MyGeotab AddInData `Get` queries (AddInData does not support `OR` conditions):
+- Legacy: `details.recordType = "booking_audit"`
+- Canonical: `details.recordType = "bookingAudit"`
+
+Both formats are normalized through the shared `normalizeAuditRecord` layer into a common `NormalizedAuditEvent` shape before reconciliation, so legacy and canonical records are compared together. Canonical events are deduplicated/flagged by `auditKey`; legacy records (no `auditKey`) use the existing compatibility behavior. Malformed records that cannot be normalized are preserved as insufficient-evidence entries rather than silently discarded.
+
+API request impact: reconciliation performs 4 `Get` calls per run (booking, booking_audit, bookingAudit, notification) — one additional call versus the Phase 24.5 baseline (3 calls) to retrieve the canonical `bookingAudit` format. No unbounded reads are introduced; all queries are bounded by `MAX_FINDINGS_PER_RUN`.
+
+Audit integrity remains application-level: reconciliation detects anomalies (missing audits, duplicate canonical events, invalid actor attribution, orphaned records) but cannot prevent direct AddInData manipulation at the platform level.
+
+### Durable Idempotency (Phase 24.6.1)
+
+`emitAuditEvent` uses deterministic `auditKey` values derived from `mode:entityId:action:previousStatus:newStatus:actorUserId:metadata`. Two layers of dedup protect against duplicate audit events:
+
+1. **In-session dedup** (`recentKeys` Set): prevents duplicate writes within a single page session.
+2. **Cross-session dedup** (read-before-write via `provider.getAuditRecords(entityId)`): before writing, checks if a canonical audit record with the same `auditKey` already exists in AddInData. Survives page reloads.
+
+**Limitation:** AddInData has no atomic compare-and-set or transactions. Exactly-once execution cannot be guaranteed. Two concurrent requests with the same `auditKey` could both read "none exists" and both write. This race is detected post-hoc by reconciliation via `DUPLICATE_AUDIT_EVENT` findings. The pending-audit queue handles write failures; no audit event is silently lost.
+
+### Audit Normalization Parity (Phase 24.6.1)
+
+`normalizeAuditRecord` and `isCanonicalAudit` exist in two locations:
+- `src/data/types.ts` — shared implementation used by UI-side code
+- `src/serviceAddin.ts` — inline copy required because the standalone Service Add-In build (`--module ESNext`, no `allowImportingTsExtensions`) cannot statically import runtime values from `types.ts`
+
+Both copies are exported from `serviceAddin.ts` and verified identical by `test/auditNormalizationParity.test.mjs` (10 tests covering canonical records, legacy records, missing optional fields, null values, malformed records, unknown record types, missing/invalid `auditKey`, and actor/status normalization).
+
+### Deterministic Canonical JSON Serialization (Phase 24.6.5)
+
+`computePayloadFingerprint()` previously used `JSON.stringify()` directly, which is not deterministic across object key insertion orders. Equivalent payloads with different key order could produce different fingerprints, causing false `IDEMPOTENCY_KEY_CONFLICT` errors or cache misses.
+
+**Remediation:** Implemented `canonicalize()` in `apps/api/src/crypto.ts`:
+- Recursively sorts object keys lexicographically
+- Preserves array element order
+- Handles `null`, `boolean`, `number`, `string` deterministically
+- Rejects unsupported types (functions, symbols, BigInt, Date, Map, Set, etc.) rather than producing ambiguous output
+- Fingerprints versioned with `"v1:"` prefix so algorithm changes never silently reinterpret stored fingerprints
+
+**Tests:** 17 canonicalization/fingerprint tests in `apps/api/test/security.test.mjs`.
+
+### Internal Write Authorization (Phase 24.6.5)
+
+Internal write methods (notifications, audit, recovery) are called from trusted app context (NotificationEngine, emitAuditEvent), but are technically callable from browser console since the user holds session credentials. Defense-in-depth remediations:
+
+- `markAsRead(notificationId, actorUserId?)` — validates `recipient_user_id` matches `actorUserId` when provided
+- `markDeliveryStatus(notificationId, status, actorUserId?)` — same recipient validation
+- `markAllAsRead(userId, actorUserId?)` — validates `userId === actorUserId` when provided
+- `deleteAuditPending(id)` — validates target is a genuine `booking_audit` pending record with non-empty server record ID before deletion
+
+These validations are optional (parameter undefined = no enforcement) to preserve DEMO mode and backward compatibility. Callers in `App.tsx` pass the verified `actorId`.
+
+**Residual risk:** Direct browser console access to these provider methods remains possible (platform limitation T1/T4). Reconciliation detects anomalies post-hoc.
+
+### Audit Reliability (Phase 24.6.5)
+
+**Crash window:** Worker writes booking → frontend emits canonical audit separately. A crash between Worker success and audit write leaves a booking without an audit event.
+
+**Remediation:**
+- `emitAuditEvent` cross-session dedup (`getAuditRecords` check before write) prevents duplicate audit events after reload/retry.
+- `recoverAuditPending` checks if a canonical audit already exists for the same booking+action+actor before re-creating a pending audit record. If canonical audit exists, the pending record is deleted without creating a duplicate.
+- Audit write failures do not roll back the booking write; booking persists and audit is queued for recovery via the pending-audit queue with exponential backoff.
+
+**Residual risk:** MEDIUM — crash window between Worker booking success and frontend audit write cannot be eliminated without platform-level transactions. Detected post-hoc by reconciliation (`MISSING_AUDIT_EVENT`).
 
 ## Open Questions / Future Work
 

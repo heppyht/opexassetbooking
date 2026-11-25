@@ -96,9 +96,11 @@ test("workflow: create booking with explicit driver persisted and shown", async 
   assert.equal(audit.ok, true);
   const records = await p.getAuditRecords(created.id);
   assert.equal(records.length, 1);
-  const details = JSON.parse(records[0].details);
-  assert.equal(details.new.driverId, "u102");
-  assert.equal(details.new.driverName, "Jane Smith");
+  assert.equal(records[0].action, "BOOKING_CREATED");
+  assert.equal(records[0].actor.userId, actorId);
+  assert.equal(records[0].newStatus, "PENDING_APPROVAL");
+  assert.equal(records[0].changes.driverId.from, null);
+  assert.equal(records[0].changes.driverId.to, "u102");
 });
 
 test("workflow: multi-day overnight booking persisted with full datetime interval", async () => {

@@ -291,16 +291,16 @@ export class NotificationEngine {
     return this.notifProvider.getUnreadCount(userId);
   }
 
-  async markAsRead(notificationId: string): Promise<void> {
-    await this.notifProvider.markAsRead(notificationId);
+  async markAsRead(notificationId: string, actorUserId: string): Promise<void> {
+    await this.notifProvider.markAsRead(notificationId, actorUserId);
   }
 
-  async markAllAsRead(userId: string): Promise<void> {
-    await this.notifProvider.markAllAsRead(userId);
+  async markAllAsRead(userId: string, actorUserId: string): Promise<void> {
+    await this.notifProvider.markAllAsRead(userId, actorUserId);
   }
 
-  async markDeliveryStatus(notificationId: string, status: "pending" | "delivered" | "failed"): Promise<void> {
-    await this.notifProvider.markDeliveryStatus(notificationId, status);
+  async markDeliveryStatus(notificationId: string, status: "pending" | "delivered" | "failed", actorUserId: string): Promise<void> {
+    await this.notifProvider.markDeliveryStatus(notificationId, status, actorUserId);
   }
 }
 

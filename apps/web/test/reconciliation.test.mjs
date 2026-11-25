@@ -25,15 +25,22 @@ function booking(id, status, version = 1) {
   return { id, status, version, requester_id: "user-1" };
 }
 
-function audit(bookingId, action, actorUserId = "user-1", newStatus = null, previousStatus = null) {
+function audit(bookingId, action, actorUserId = "user-1", newStatus = null, previousStatus = null, opts = {}) {
+  const sourceFormat = opts.sourceFormat === "canonical" ? "canonical" : "legacy";
   return {
     id: `audit-${bookingId}-${action}`,
-    booking_id: bookingId,
+    recordType: sourceFormat === "canonical" ? "bookingAudit" : "booking_audit",
+    schemaVersion: 1,
+    auditKey: opts.auditKey ?? (sourceFormat === "canonical" ? `audit-key-${bookingId}-${action}` : undefined),
+    bookingKey: bookingId,
     action,
-    actor_user_id: actorUserId,
-    new_status: newStatus,
-    previous_status: previousStatus,
-    created_at: "2026-01-01T00:00:00Z",
+    actor: { userId: actorUserId },
+    occurredAtUtc: "2026-01-01T00:00:00Z",
+    previousStatus,
+    newStatus,
+    changes: null,
+    metadata: null,
+    sourceFormat,
   };
 }
 
@@ -211,6 +218,104 @@ test("reconciliation: finding has all required fields", () => {
   assert.ok(Array.isArray(f.related_audit_references));
   assert.equal(f.reconciliation_status, "OPEN");
   assert.ok(f.notes);
+});
+
+/*───────────────────── Dual-format audit reconciliation tests ─────────────────────*/
+
+test("reconciliation: canonical bookingAudit records are normalized and reconciled", () => {
+  const bookings = [booking("b1", "APPROVED")];
+  const audits = [
+    audit("b1", "BOOKING_CREATED", "user-1", "PENDING_APPROVAL", null, { sourceFormat: "canonical" }),
+    audit("b1", "BOOKING_APPROVED", "approver-user", "APPROVED", "PENDING_APPROVAL", { sourceFormat: "canonical" }),
+  ];
+  const findings = reconcileAuditEnhanced(bookings, audits, []);
+  const missing = findings.find(f => f.booking_id === "b1" && f.finding_type === "MISSING_AUDIT_EVENT");
+  assert.equal(missing, undefined, "Canonical audits should satisfy expected audit actions");
+  const dup = findings.find(f => f.finding_type === "DUPLICATE_AUDIT_EVENT");
+  assert.equal(dup, undefined, "Distinct canonical auditKeys should not be flagged as duplicates");
+});
+
+test("reconciliation: legacy booking_audit records are normalized and reconciled", () => {
+  const bookings = [booking("b1", "APPROVED")];
+  const audits = [
+    audit("b1", "BOOKING_CREATED", "user-1", "PENDING_APPROVAL", null, { sourceFormat: "legacy" }),
+    audit("b1", "BOOKING_APPROVED", "approver-user", "APPROVED", "PENDING_APPROVAL", { sourceFormat: "legacy" }),
+  ];
+  const findings = reconcileAuditEnhanced(bookings, audits, []);
+  const missing = findings.find(f => f.booking_id === "b1" && f.finding_type === "MISSING_AUDIT_EVENT");
+  assert.equal(missing, undefined, "Legacy audits should satisfy expected audit actions");
+});
+
+test("reconciliation: mixed legacy and canonical audit records are reconciled together", () => {
+  const bookings = [booking("b1", "APPROVED")];
+  const audits = [
+    audit("b1", "BOOKING_CREATED", "user-1", "PENDING_APPROVAL", null, { sourceFormat: "legacy" }),
+    audit("b1", "BOOKING_APPROVED", "approver-user", "APPROVED", "PENDING_APPROVAL", { sourceFormat: "canonical" }),
+  ];
+  const findings = reconcileAuditEnhanced(bookings, audits, []);
+  const missing = findings.find(f => f.booking_id === "b1" && f.finding_type === "MISSING_AUDIT_EVENT");
+  assert.equal(missing, undefined, "Mixed formats should together satisfy expected audit actions");
+});
+
+test("reconciliation: duplicate canonical audit events are detected by auditKey", () => {
+  const bookings = [booking("b1", "PENDING_APPROVAL")];
+  const audits = [
+    audit("b1", "BOOKING_CREATED", "user-1", "PENDING_APPROVAL", null, { sourceFormat: "canonical", auditKey: "shared-key" }),
+    audit("b1", "BOOKING_CREATED", "user-1", "PENDING_APPROVAL", null, { sourceFormat: "canonical", auditKey: "shared-key" }),
+  ];
+  const findings = reconcileAuditEnhanced(bookings, audits, []);
+  const dup = findings.find(f => f.finding_type === "DUPLICATE_AUDIT_EVENT");
+  assert.ok(dup, "Expected DUPLICATE_AUDIT_EVENT finding for shared auditKey");
+  assert.equal(dup.severity, "HIGH");
+  assert.ok(dup.notes.includes("shared-key"));
+});
+
+test("reconciliation: legacy records without auditKey are not flagged as duplicates", () => {
+  const bookings = [booking("b1", "PENDING_APPROVAL")];
+  const audits = [
+    audit("b1", "BOOKING_CREATED", "user-1", "PENDING_APPROVAL", null, { sourceFormat: "legacy" }),
+    audit("b1", "BOOKING_CREATED", "user-1", "PENDING_APPROVAL", null, { sourceFormat: "legacy" }),
+  ];
+  const findings = reconcileAuditEnhanced(bookings, audits, []);
+  const dup = findings.find(f => f.finding_type === "DUPLICATE_AUDIT_EVENT");
+  assert.equal(dup, undefined, "Legacy records have no auditKey and should not be duplicate-flagged");
+});
+
+test("reconciliation: canonical records with distinct auditKeys are not duplicates", () => {
+  const bookings = [booking("b1", "PENDING_APPROVAL")];
+  const audits = [
+    audit("b1", "BOOKING_CREATED", "user-1", "PENDING_APPROVAL", null, { sourceFormat: "canonical", auditKey: "key-a" }),
+    audit("b1", "BOOKING_CREATED", "user-1", "PENDING_APPROVAL", null, { sourceFormat: "canonical", auditKey: "key-b" }),
+  ];
+  const findings = reconcileAuditEnhanced(bookings, audits, []);
+  const dup = findings.find(f => f.finding_type === "DUPLICATE_AUDIT_EVENT");
+  assert.equal(dup, undefined, "Distinct canonical auditKeys should not be flagged");
+});
+
+test("reconciliation: malformed audit records do not crash reconciliation", () => {
+  /* APPROVED booking expects BOOKING_APPROVED; supply only CREATED plus a null
+     and an unknown-typed record. Reconciliation must not crash on malformed
+     records and should still evaluate the well-formed audit. */
+  const bookings = [booking("b1", "APPROVED")];
+  const audits = [
+    audit("b1", "BOOKING_CREATED", "user-1", "PENDING_APPROVAL", null, { sourceFormat: "legacy" }),
+    null,
+    { recordType: "unknown_type", details: "garbage" },
+  ];
+  const findings = reconcileAuditEnhanced(bookings, audits, []);
+  assert.ok(Array.isArray(findings), "Should return findings array");
+  const missing = findings.find(f => f.booking_id === "b1" && f.finding_type === "MISSING_AUDIT_EVENT");
+  assert.ok(missing, "APPROVED booking should still be evaluated for missing audit events");
+  assert.ok(missing.notes.includes("BOOKING_APPROVED"));
+});
+
+test("reconciliation: missing audit event detected for canonical audit only", () => {
+  const bookings = [booking("b1", "APPROVED")];
+  const audits = [audit("b1", "BOOKING_CREATED", "user-1", "PENDING_APPROVAL", null, { sourceFormat: "canonical" })];
+  const findings = reconcileAuditEnhanced(bookings, audits, []);
+  const missing = findings.find(f => f.booking_id === "b1" && f.finding_type === "MISSING_AUDIT_EVENT");
+  assert.ok(missing, "Expected MISSING_AUDIT_EVENT for missing BOOKING_APPROVED");
+  assert.ok(missing.notes.includes("BOOKING_APPROVED"));
 });
 
 /*───────────────────── toOpexReconciliationFinding Tests ─────────────────────*/

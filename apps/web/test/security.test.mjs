@@ -55,8 +55,11 @@ function loadingIdentity() {
 }
 
 function mockProvider() {
+  const calls = [];
   return {
+    calls,
     createAuditRecord: async () => {},
+    createBookingAuditEvent: async (input) => { calls.push(input); },
   };
 }
 
@@ -262,7 +265,7 @@ test("security: isAuthorizedActor accepts matching actorUserId with whitespace",
 
 /*───────────────────── Audit Actor Validation Tests ─────────────────────*/
 
-test("security: emitAuditEvent rejects actorUserId mismatch with authenticated identity", async () => {
+test("security: emitAuditEvent derives actor from verified principal (caller actorUserId ignored)", async () => {
   resetAuditDedupForTests();
   resetAuditQueueForTests();
   const identity = authenticatedIdentity(["APPROVER"]);
@@ -276,8 +279,7 @@ test("security: emitAuditEvent rejects actorUserId mismatch with authenticated i
     previousStatus: "PENDING_APPROVAL",
     newStatus: "APPROVED",
   });
-  assert.equal(result.ok, false);
-  assert.equal(result.error, "AUDIT_ACTOR_MISMATCH");
+  assert.equal(result.ok, true);
 });
 
 test("security: emitAuditEvent accepts matching actorUserId with authenticated identity", async () => {
@@ -297,7 +299,7 @@ test("security: emitAuditEvent accepts matching actorUserId with authenticated i
   assert.equal(result.ok, true);
 });
 
-test("security: emitAuditEvent allows actorUserId when identity is null (backward compat)", async () => {
+test("security: emitAuditEvent fails closed when identity is null in LIVE mode", async () => {
   resetAuditDedupForTests();
   resetAuditQueueForTests();
   const result = await emitAuditEvent({
@@ -310,10 +312,11 @@ test("security: emitAuditEvent allows actorUserId when identity is null (backwar
     previousStatus: "PENDING_APPROVAL",
     newStatus: "APPROVED",
   });
-  assert.equal(result.ok, true);
+  assert.equal(result.ok, false);
+  assert.equal(result.error, "AUDIT_ACTOR_UNVERIFIED");
 });
 
-test("security: emitAuditEvent allows actorUserId when identity is unresolved", async () => {
+test("security: emitAuditEvent fails closed when identity is unresolved in LIVE mode", async () => {
   resetAuditDedupForTests();
   resetAuditQueueForTests();
   const result = await emitAuditEvent({
@@ -326,7 +329,8 @@ test("security: emitAuditEvent allows actorUserId when identity is unresolved", 
     previousStatus: "PENDING_APPROVAL",
     newStatus: "APPROVED",
   });
-  assert.equal(result.ok, true);
+  assert.equal(result.ok, false);
+  assert.equal(result.error, "AUDIT_ACTOR_UNVERIFIED");
 });
 
 /*───────────────────── canPerformLiveWrite Fail-Closed Tests ─────────────────────*/
@@ -531,4 +535,256 @@ test("security: audit reconciliation — booking with no audit records", () => {
 test("security: audit reconciliation — empty bookings array", () => {
   const results = reconcileAudit([], []);
   assert.equal(results.length, 0);
+});
+
+/*───────────────────── Worker Execute Routing Tests ─────────────────────*/
+/* These tests verify that protected booking writes route through the
+   Cloudflare Authorization Worker (/authz/execute) and do not bypass
+   via direct AddInData calls from the browser. */
+
+function makeExecuteMock() {
+  const calls = [];
+  return {
+    calls,
+    execute: async (...args) => {
+      calls.push(args);
+      return { success: true, recordId: "server-record-1", actorUserId: "verified-user" };
+    },
+  };
+}
+
+function makeExecuteMockFailing() {
+  const calls = [];
+  return {
+    calls,
+    execute: async (...args) => {
+      calls.push(args);
+      return { success: false, error: "WORKER_ERROR", reason: "SERVER_ERROR" };
+    },
+  };
+}
+
+function makeExecuteMockConflict() {
+  const calls = [];
+  return {
+    calls,
+    execute: async (...args) => {
+      calls.push(args);
+      return { success: false, error: "IDEMPOTENCY_KEY_CONFLICT", reason: "IDEMPOTENCY_KEY_CONFLICT" };
+    },
+  };
+}
+
+/* Minimal GeotabApi mock: Get calls return a non-conflicting booking record
+   (for findBookingRecord to resolve "b1"), Add/Set/Remove are not called
+   directly (writes go through Worker). */
+function makeMockApi() {
+  const directWrites = [];
+  return {
+    directWrites,
+    call: (method, params, success) => {
+      if (method === "Get") {
+        /* Return a booking record at a DIFFERENT time (no overlap with test
+           bookings at 2026-11-20T08:00-09:00) so conflict check passes, but
+           findBookingRecord("b1") can still resolve by application ID. */
+        success([{
+          id: "server-record-b1",
+          addInId: params.search?.addInId,
+          details: {
+            recordType: "booking",
+            schemaVersion: 1,
+            id: "b1",
+            deviceId: "d1",
+            requesterUserId: "u1",
+            status: "PENDING_APPROVAL",
+            startAt: "2026-11-25T08:00:00.000Z",
+            endAt: "2026-11-25T09:00:00.000Z",
+            purpose: "Existing trip",
+            destination: null,
+            passengerCount: null,
+            version: 1,
+          },
+          groups: [{ id: "GroupCompanyId" }],
+        }]);
+      } else if (method === "Add" || method === "Set" || method === "Remove" || method === "Delete") {
+        /* Track direct writes (should not happen for booking writes in LIVE mode) */
+        directWrites.push({ method, typeName: params.typeName });
+        if (method === "Add") success({ id: "direct-add-id" });
+        else success(null);
+      } else {
+        success(null);
+      }
+    },
+  };
+}
+
+function makeDirectWriteTrackingProvider(executeMock) {
+  const directWrites = [];
+  return {
+    directWrites,
+    isLive: () => true,
+    async apiCall(method, params) {
+      directWrites.push({ method, typeName: params.typeName });
+      if (method === "Add") return { id: "direct-add-id" };
+      return null;
+    },
+    async createBookingAuditEvent() {},
+    async getAuditRecords() { return []; },
+  };
+}
+
+test("security: createBooking routes through Worker execute, not direct apiCall", async () => {
+  const executeMock = makeExecuteMock();
+  const mockApi = makeMockApi();
+  const { AddInDataBookingDataProvider } = await import("../src/data/addinDataProvider.ts");
+  const liveProvider = new AddInDataBookingDataProvider(mockApi, "aAAAAAAAAAAAAAAAAAAAAAA", "GroupCompanyId", executeMock, {
+    sessionId: "sess-1",
+    database: "opex_trial",
+    server: "https://example.com",
+    userName: "testuser",
+  });
+
+  await liveProvider.createBooking({
+    deviceId: "d1",
+    requesterUserId: "u1",
+    requestedClass: "PASSENGER",
+    startAt: "2026-11-20T08:00:00.000Z",
+    endAt: "2026-11-20T09:00:00.000Z",
+    purpose: "Trip",
+    destination: null,
+    passengerCount: null,
+  });
+
+  /* Worker execute was called */
+  assert.equal(executeMock.calls.length, 1);
+  assert.equal(executeMock.calls[0][3], "create_booking"); // action
+  assert.equal(executeMock.calls[0][6], "add"); // operation
+
+  /* No direct apiCall write (only Gets for conflict check) */
+  const directWrites = mockApi.directWrites.filter(w => w.method !== "Get");
+  assert.equal(directWrites.length, 0);
+});
+
+test("security: updateBookingStatus routes through Worker execute, not direct apiCall", async () => {
+  const executeMock = makeExecuteMock();
+  const mockApi = makeMockApi();
+  const { AddInDataBookingDataProvider } = await import("../src/data/addinDataProvider.ts");
+  const liveProvider = new AddInDataBookingDataProvider(mockApi, "aAAAAAAAAAAAAAAAAAAAAAA", "GroupCompanyId", executeMock, {
+    sessionId: "sess-1",
+    database: "opex_trial",
+    server: "https://example.com",
+    userName: "testuser",
+  });
+
+  await liveProvider.updateBookingStatus("b1", "APPROVED", 1, "approver-1", "Approved");
+
+  assert.equal(executeMock.calls.length, 1);
+  assert.equal(executeMock.calls[0][3], "approve_booking"); // action (canonical Worker contract)
+  assert.equal(executeMock.calls[0][4], "b1"); // bookingId
+  assert.equal(executeMock.calls[0][6], "set"); // operation
+
+  /* No direct apiCall write */
+  const directWrites = mockApi.directWrites.filter(w => w.method !== "Get");
+  assert.equal(directWrites.length, 0);
+});
+
+test("security: deleteBooking routes through Worker execute, not direct apiCall", async () => {
+  const executeMock = makeExecuteMock();
+  const mockApi = makeMockApi();
+  const { AddInDataBookingDataProvider } = await import("../src/data/addinDataProvider.ts");
+  const liveProvider = new AddInDataBookingDataProvider(mockApi, "aAAAAAAAAAAAAAAAAAAAAAA", "GroupCompanyId", executeMock, {
+    sessionId: "sess-1",
+    database: "opex_trial",
+    server: "https://example.com",
+    userName: "testuser",
+  });
+
+  await liveProvider.deleteBooking("b1");
+
+  assert.equal(executeMock.calls.length, 1);
+  assert.equal(executeMock.calls[0][3], "delete_booking"); // action
+  assert.equal(executeMock.calls[0][4], "b1"); // bookingId
+  assert.equal(executeMock.calls[0][6], "remove"); // operation
+
+  /* No direct apiCall write */
+  const directWrites = mockApi.directWrites.filter(w => w.method !== "Get");
+  assert.equal(directWrites.length, 0);
+});
+
+test("security: Worker write failure causes rejection, no direct-write fallback", async () => {
+  const executeMock = makeExecuteMockFailing();
+  const mockApi = makeMockApi();
+  const { AddInDataBookingDataProvider } = await import("../src/data/addinDataProvider.ts");
+  const liveProvider = new AddInDataBookingDataProvider(mockApi, "aAAAAAAAAAAAAAAAAAAAAAA", "GroupCompanyId", executeMock, {
+    sessionId: "sess-1",
+    database: "opex_trial",
+    server: "https://example.com",
+    userName: "testuser",
+  });
+
+  await assert.rejects(
+    liveProvider.createBooking({
+      deviceId: "d1",
+      requesterUserId: "u1",
+      requestedClass: "PASSENGER",
+      startAt: "2026-11-20T08:00:00.000Z",
+      endAt: "2026-11-20T09:00:00.000Z",
+      purpose: "Trip",
+      destination: null,
+      passengerCount: null,
+    }),
+    /WORKER_WRITE_FAILED/
+  );
+
+  /* Worker execute was attempted */
+  assert.equal(executeMock.calls.length, 1);
+
+  /* No direct write fallback attempted */
+  const directWrites = mockApi.directWrites.filter(w => w.method !== "Get");
+  assert.equal(directWrites.length, 0);
+});
+
+test("security: idempotency key conflict from Worker is propagated", async () => {
+  const executeMock = makeExecuteMockConflict();
+  const mockApi = makeMockApi();
+  const { AddInDataBookingDataProvider } = await import("../src/data/addinDataProvider.ts");
+  const liveProvider = new AddInDataBookingDataProvider(mockApi, "aAAAAAAAAAAAAAAAAAAAAAA", "GroupCompanyId", executeMock, {
+    sessionId: "sess-1",
+    database: "opex_trial",
+    server: "https://example.com",
+    userName: "testuser",
+  });
+
+  await assert.rejects(
+    liveProvider.createBooking({
+      deviceId: "d1",
+      requesterUserId: "u1",
+      requestedClass: "PASSENGER",
+      startAt: "2026-11-20T08:00:00.000Z",
+      endAt: "2026-11-20T09:00:00.000Z",
+      purpose: "Trip",
+      destination: null,
+      passengerCount: null,
+    }),
+    /IDEMPOTENCY_KEY_CONFLICT/
+  );
+});
+
+test("security: DEMO mode without serverAuthz uses direct write (fallback)", async () => {
+  const mockApi = makeMockApi();
+  const { AddInDataBookingDataProvider } = await import("../src/data/addinDataProvider.ts");
+  const demoProvider = new AddInDataBookingDataProvider(mockApi, "aAAAAAAAAAAAAAAAAAAAAAA", "GroupCompanyId", null, null);
+
+  await demoProvider.createBooking({
+    deviceId: "d1",
+    requesterUserId: "u1",
+    requestedClass: "PASSENGER",
+    startAt: "2026-11-20T08:00:00.000Z",
+    endAt: "2026-11-20T09:00:00.000Z",
+    purpose: "Trip",
+    destination: null,
+    passengerCount: null,
+  });
+  /* DEMO mode should complete without throwing (direct write path) */
+  assert.ok(true, "DEMO mode createBooking completes via direct write fallback");
 });

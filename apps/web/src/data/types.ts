@@ -69,7 +69,7 @@ export interface BookingValidationResult {
    entity store. Every persistent record carries recordType and
    schemaVersion so the client can normalize legacy records and evolve
    the schema without server-side migrations. */
-export type RecordType = "booking" | "booking_audit" | "notification" | "vehicle_hold" | "audit_dead_letter" | "reconciliation_finding";
+export type RecordType = "booking" | "booking_audit" | "bookingAudit" | "notification" | "vehicle_hold" | "audit_dead_letter" | "reconciliation_finding";
 
 export const SCHEMA_VERSION = 1;
 
@@ -255,6 +255,148 @@ export interface OpexBookingAudit {
   created_at: string;
 }
 
+/*───────────────────── Canonical Booking Audit Event (bookingAudit) ─────────────────────*/
+/* Canonical, structured, compact audit event schema. recordType "bookingAudit"
+   is the new standard; legacy "booking_audit" records remain readable via the
+   normalization layer (auditEvent.ts) and are never rewritten or deleted. */
+
+/* Standardized business event names emitted by the booking audit trail. */
+export type BookingAction =
+  | "BOOKING_CREATED"
+  | "BOOKING_UPDATED"
+  | "BOOKING_SUBMITTED"
+  | "BOOKING_APPROVED"
+  | "BOOKING_REJECTED"
+  | "BOOKING_CANCELLED"
+  | "BOOKING_RESCHEDULED"
+  | "VEHICLE_ASSIGNED"
+  | "DRIVER_ASSIGNED"
+  | "BOOKING_COMPLETED";
+
+/* Verified actor identity derived from the authenticated MyGeotab principal.
+   userId is the primary identifier; userName and role are included only when
+   verified and available (never trusted from the browser). */
+export interface ActorInfo {
+  userId: string;
+  userName?: string;
+  role?: string;
+}
+
+/* A single changed field with before/after values. null means the field did
+   not previously exist. Only fields that actually changed are stored. */
+export interface AuditChange {
+  from: unknown;
+  to: unknown;
+}
+
+/* Minimal technical context. No session IDs, credentials, or request bodies. */
+export interface AuditMetadata {
+  source: string;
+  mode: "ADDIN_DATA" | "DEMO";
+}
+
+/* Canonical booking audit event stored in AddInData as recordType "bookingAudit". */
+export interface OpexBookingAuditV2 {
+  recordType: "bookingAudit";
+  schemaVersion: 1;
+  auditKey: string;
+  bookingKey: string;
+  action: BookingAction;
+  actor: ActorInfo;
+  occurredAtUtc: string;
+  previousStatus: string | null;
+  newStatus: string | null;
+  changes: Record<string, AuditChange>;
+  metadata: AuditMetadata;
+}
+
+/* Guard: true when a parsed AddInData record is a canonical bookingAudit event. */
+export function isCanonicalAudit(record: unknown): record is OpexBookingAuditV2 {
+  return typeof record === "object" && record !== null && (record as Record<string, unknown>).recordType === "bookingAudit";
+}
+
+/* Input for creating a canonical booking audit event (recordType/schemaVersion
+   are set by the provider at write time). */
+export type CanonicalAuditInput = Omit<OpexBookingAuditV2, "recordType" | "schemaVersion">;
+
+/* Normalized audit event usable by UI/reconciliation regardless of storage
+   format (legacy "booking_audit" or canonical "bookingAudit"). */
+export interface NormalizedAuditEvent {
+  recordType: RecordType;
+  schemaVersion: number;
+  id: string;
+  auditKey?: string;
+  bookingKey?: string;
+  action: string;
+  actor: ActorInfo;
+  occurredAtUtc?: string;
+  previousStatus: string | null;
+  newStatus: string | null;
+  changes: Record<string, AuditChange> | null;
+  metadata: AuditMetadata | null;
+  sourceFormat: "canonical" | "legacy";
+}
+
+/* Normalize any AddInData audit record (legacy or canonical) into a common
+   in-memory shape. Records that cannot be normalized are preserved as
+   legacy/insufficient-evidence entries rather than silently dropped. */
+export function normalizeAuditRecord(
+  raw: unknown,
+  addInRecordId?: string,
+): NormalizedAuditEvent | null {
+  if (!raw || typeof raw !== "object") return null;
+  const obj = raw as Record<string, unknown>;
+  const recordType = obj.recordType;
+  const now = new Date().toISOString();
+
+  if (recordType === "bookingAudit") {
+    const actorRaw = obj.actor && typeof obj.actor === "object" ? (obj.actor as Record<string, unknown>) : null;
+    const actor: ActorInfo = actorRaw
+      ? {
+          userId: String(actorRaw.userId ?? ""),
+          ...(typeof actorRaw.userName === "string" ? { userName: actorRaw.userName } : {}),
+          ...(typeof actorRaw.role === "string" ? { role: actorRaw.role } : {}),
+        }
+      : { userId: String(obj.actor_user_id ?? ""), userName: undefined, role: undefined };
+    return {
+      recordType: "bookingAudit",
+      schemaVersion: Number(obj.schemaVersion ?? 1),
+      id: String(obj.auditKey ?? obj.id ?? addInRecordId ?? ""),
+      auditKey: String(obj.auditKey ?? ""),
+      bookingKey: String(obj.bookingKey ?? obj.booking_id ?? ""),
+      action: String(obj.action ?? ""),
+      actor,
+      occurredAtUtc: typeof obj.occurredAtUtc === "string" ? obj.occurredAtUtc : undefined,
+      previousStatus: (obj.previousStatus as string | null) ?? null,
+      newStatus: (obj.newStatus as string | null) ?? null,
+      changes: obj.changes && typeof obj.changes === "object" ? (obj.changes as Record<string, AuditChange>) : null,
+      metadata: obj.metadata && typeof obj.metadata === "object" ? (obj.metadata as AuditMetadata) : null,
+      sourceFormat: "canonical",
+    };
+  }
+
+  /* Legacy "booking_audit" normalization. */
+  if (recordType === "booking_audit") {
+    return {
+      recordType: "booking_audit",
+      schemaVersion: Number(obj.schemaVersion ?? 1),
+      id: String(obj.id ?? addInRecordId ?? ""),
+      auditKey: undefined,
+      bookingKey: String(obj.booking_id ?? ""),
+      action: String(obj.action ?? ""),
+      actor: { userId: String(obj.actor_user_id ?? ""), userName: undefined, role: undefined },
+      occurredAtUtc: typeof obj.created_at === "string" ? obj.created_at : undefined,
+      previousStatus: (obj.previous_status as string | null) ?? null,
+      newStatus: (obj.new_status as string | null) ?? null,
+      changes: null,
+      metadata: null,
+      sourceFormat: "legacy",
+    };
+  }
+
+  return null;
+}
+
 /*───────────────────── Audit pending queue (retry/recovery) ─────────────────────*/
 /* Audit records that failed to write to AddInData are stored here as pending
    records with recordType "booking_audit". A recovery process retries them
@@ -320,6 +462,7 @@ export type ReconciliationFindingType =
   | "INVALID_ACTOR_ATTRIBUTION"
   | "VERSION_MISMATCH"
   | "DUPLICATE_BOOKING_RECORD"
+  | "DUPLICATE_AUDIT_EVENT"
   | "RECORD_MODIFIED_WITHOUT_AUDIT"
   | "RECORD_DELETED_WITHOUT_AUDIT"
   | "NOTIFICATION_MANIPULATION"
@@ -382,9 +525,9 @@ export interface NotificationDataProvider {
     message: string;
   }): Promise<OpexNotification>;
   findByIdempotencyKey(idempotencyKey: string): Promise<OpexNotification | null>;
-  markAsRead(notificationId: string): Promise<void>;
-  markAllAsRead(userId: string): Promise<void>;
-  markDeliveryStatus(notificationId: string, status: "pending" | "delivered" | "failed"): Promise<void>;
+  markAsRead(notificationId: string, actorUserId: string): Promise<void>;
+  markAllAsRead(userId: string, actorUserId: string): Promise<void>;
+  markDeliveryStatus(notificationId: string, status: "pending" | "delivered" | "failed", actorUserId: string): Promise<void>;
   createAuditRecord(input: {
     booking_id: string;
     action: string;
@@ -393,7 +536,8 @@ export interface NotificationDataProvider {
     new_status: string | null;
     details: string | null;
   }): Promise<void>;
-  getAuditRecords(bookingId: string): Promise<OpexBookingAudit[]>;
+  createBookingAuditEvent(input: CanonicalAuditInput): Promise<void>;
+  getAuditRecords(bookingId: string): Promise<NormalizedAuditEvent[]>;
   createAuditPending(input: Omit<OpexAuditPending, "id" | "schemaVersion" | "recordType" | "created_at" | "retry_count" | "next_retry_at" | "max_retries" | "last_error">): Promise<OpexAuditPending>;
   getAuditPending(): Promise<OpexAuditPending[]>;
   deleteAuditPending(id: string): Promise<void>;

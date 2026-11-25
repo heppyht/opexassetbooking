@@ -4,6 +4,10 @@
    overlap prevention, and manual refresh support. */
 
 import { useEffect, useRef, useState, useCallback } from "react";
+import { exponentialBackoffMs, applyJitter } from "../data/polling";
+
+/* Upper bound for backoff after repeated transient errors. */
+const MAX_BACKOFF_MS = 5 * 60 * 1000;
 
 /*───────────────────── useAutoRefresh ─────────────────────*/
 
@@ -26,6 +30,10 @@ export function useAutoRefresh({
   const refreshRef = useRef(false);
   const cbRef = useRef(onRefresh);
   const errorRef = useRef(onError);
+  /* Adaptive delay: starts at intervalMs, backs off after transient errors,
+     and resets to intervalMs after a successful refresh. */
+  const nextDelayRef = useRef(intervalMs);
+  const errorCountRef = useRef(0);
 
   // Keep callbacks fresh
   cbRef.current = onRefresh;
@@ -35,7 +43,7 @@ export function useAutoRefresh({
     if (!enabled || !timerRef.current) return;
     timerRef.current = setTimeout(() => {
       triggerRefresh();
-    }, intervalMs);
+    }, nextDelayRef.current);
   }, [enabled, intervalMs]);
 
   const triggerRefresh = useCallback(async () => {
@@ -45,7 +53,15 @@ export function useAutoRefresh({
     try {
       await cbRef.current();
       setLastUpdated(new Date());
+      // Success: reset adaptive backoff.
+      errorCountRef.current = 0;
+      nextDelayRef.current = intervalMs;
     } catch (e) {
+      // Transient error: back off (bounded exponential + jitter) before retry.
+      errorCountRef.current += 1;
+      nextDelayRef.current = applyJitter(
+        exponentialBackoffMs(errorCountRef.current, intervalMs, MAX_BACKOFF_MS),
+      );
       errorRef.current?.(e instanceof Error ? e : new Error(String(e)));
     } finally {
       setIsRefreshing(false);
@@ -54,7 +70,7 @@ export function useAutoRefresh({
         scheduleNext();
       }
     }
-  }, [enabled, scheduleNext]);
+  }, [enabled, intervalMs, scheduleNext]);
 
   const manualRefresh = useCallback(async () => {
     await triggerRefresh();
@@ -69,7 +85,7 @@ export function useAutoRefresh({
     if (enabled) {
       timerRef.current = setTimeout(() => {
         triggerRefresh();
-      }, intervalMs);
+      }, nextDelayRef.current);
     }
     return () => {
       if (timerRef.current) {
@@ -90,7 +106,7 @@ export function useAutoRefresh({
       } else if (enabled) {
         timerRef.current = setTimeout(() => {
           triggerRefresh();
-        }, intervalMs);
+        }, nextDelayRef.current);
       }
     };
     document.addEventListener("visibilitychange", handleVisibilityChange);

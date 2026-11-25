@@ -42,17 +42,14 @@ test("workflow: create booking (DEMO) - state, actor, single audit, fields", asy
   const records = await p.getAuditRecords(created.id);
   assert.equal(records.length, 1);
   assert.equal(records[0].action, "BOOKING_CREATED");
-  assert.equal(records[0].actor_user_id, actorId);
-  assert.equal(records[0].previous_status, null);
-  assert.equal(records[0].new_status, "PENDING_APPROVAL");
-  assert.equal(records[0].booking_id, created.id);
-  assert.ok(records[0].created_at);
-  const details = JSON.parse(records[0].details);
-  assert.equal(details.entityType, "BOOKING");
-  assert.equal(details.entityId, created.id);
-  assert.equal(details.mode, "DEMO");
-  assert.equal(details.new.destination, "Site A");
-  assert.equal(details.new.purpose, "Trip");
+  assert.equal(records[0].actor.userId, actorId);
+  assert.equal(records[0].previousStatus, null);
+  assert.equal(records[0].newStatus, "PENDING_APPROVAL");
+  assert.equal(records[0].bookingKey, created.id);
+  assert.ok(records[0].occurredAtUtc);
+  assert.equal(records[0].changes.destination.to, "Site A");
+  assert.equal(records[0].changes.purpose.to, "Trip");
+  assert.equal(records[0].metadata.mode, "DEMO");
 });
 
 test("workflow: approve/reject/assign/complete/cancel transitions with single audits and correct actors", async () => {
@@ -69,21 +66,21 @@ test("workflow: approve/reject/assign/complete/cancel transitions with single au
   assert.equal(r.ok, true);
   let audits = await p.getAuditRecords(b.id);
   assert.equal(audits.filter(a => a.action === "BOOKING_APPROVED").length, 1);
-  assert.equal(audits.find(a => a.action === "BOOKING_APPROVED").actor_user_id, demoActor);
+  assert.equal(audits.find(a => a.action === "BOOKING_APPROVED").actor.userId, demoActor);
 
   b = await p.createBooking(createInput());
   prev = snapshotBooking(b);
   await p.updateBookingStatus(b.id, "REJECTED", b.version, livePrincipal, "No vehicle");
   updated = (await p.getBookings()).find(x => x.id === b.id);
   assert.equal(updated.status, "REJECTED");
-  r = await emitAuditEvent({ mode: "ADDIN_DATA", provider: p, entityId: b.id, action: "BOOKING_REJECTED", actorUserId: livePrincipal, previousStatus: prev.status, newStatus: "REJECTED", previous: prev, next: snapshotBooking(updated), metadata: { reason: "No vehicle" }, idempotencyKey: `LIVE:${b.id}:REJECTED` });
+  r = await emitAuditEvent({ mode: "ADDIN_DATA", provider: p, entityId: b.id, action: "BOOKING_REJECTED", actorUserId: livePrincipal, previousStatus: prev.status, newStatus: "REJECTED", previous: prev, next: snapshotBooking(updated), metadata: { reason: "No vehicle" }, idempotencyKey: `LIVE:${b.id}:REJECTED`, identity: { status: "authenticated", principal: { id: livePrincipal, name: livePrincipal, roles: ["APPROVER"], session: {} }, session: {} } });
   assert.equal(r.ok, true);
   audits = await p.getAuditRecords(b.id);
   const rej = audits.find(a => a.action === "BOOKING_REJECTED");
-  assert.equal(rej.actor_user_id, livePrincipal);
-  assert.equal(rej.previous_status, "PENDING_APPROVAL");
-  assert.equal(rej.new_status, "REJECTED");
-  assert.equal(JSON.parse(rej.details).metadata.reason, "No vehicle");
+  assert.equal(rej.actor.userId, livePrincipal);
+  assert.equal(rej.previousStatus, "PENDING_APPROVAL");
+  assert.equal(rej.newStatus, "REJECTED");
+  assert.equal(rej.metadata.reason, "No vehicle");
 
   b = await p.createBooking(createInput());
   await p.updateBookingStatus(b.id, "APPROVED", b.version, demoActor);
@@ -128,7 +125,7 @@ test("audit failure after successful booking write: booking persisted, audit rep
   const failProvider = {
     ...p,
     isLive: () => p.isLive(),
-    createAuditRecord: async () => { throw new Error("AUDIT_STORE_DOWN"); },
+    createBookingAuditEvent: async () => { throw new Error("AUDIT_STORE_DOWN"); },
   };
   resetAuditDedupForTests();
   const audit = await emitAuditEvent({ mode: "DEMO", provider: failProvider, entityId: created.id, action: "BOOKING_CREATED", actorUserId: "demo-user", previousStatus: null, newStatus: "PENDING_APPROVAL", previous: null, next: snapshotBooking(created), idempotencyKey: `DEMO:${created.id}:BOOKING_CREATED_FAIL` });
@@ -152,7 +149,7 @@ test("booking write failure: no audit emitted for failed write", async () => {
   assert.equal(createCalled, false);
 });
 
-test("duplicate submission/reload: in-memory dedup only; reload clears dedup (no durable idempotency)", async () => {
+test("duplicate submission/reload: cross-session dedup prevents duplicate audit after reset", async () => {
   const p = await freshDemoProvider();
   const b = await p.createBooking(createInput());
   const key = `DEMO:${b.id}:BOOKING_CREATED`;
@@ -161,10 +158,13 @@ test("duplicate submission/reload: in-memory dedup only; reload clears dedup (no
   assert.equal(e1.ok, true);
   assert.equal(e2.deduped, true);
   assert.equal((await p.getAuditRecords(b.id)).length, 1);
+  /* After clearing in-memory dedup (simulating page reload), cross-session
+     dedup via getAuditRecords still prevents a duplicate audit record. */
   resetAuditDedupForTests();
   const e3 = await emitAuditEvent({ mode: "DEMO", provider: p, entityId: b.id, action: "BOOKING_CREATED", actorUserId: "u1", idempotencyKey: key });
   assert.equal(e3.ok, true);
-  assert.equal((await p.getAuditRecords(b.id)).length, 2);
+  assert.equal(e3.deduped, true);
+  assert.equal((await p.getAuditRecords(b.id)).length, 1);
 });
 
 test("reconciliation assessment: audit records queryable by booking id", async () => {
@@ -172,7 +172,7 @@ test("reconciliation assessment: audit records queryable by booking id", async (
   const b = await p.createBooking(createInput());
   await emitAuditEvent({ mode: "DEMO", provider: p, entityId: b.id, action: "BOOKING_CREATED", actorUserId: "u1", previousStatus: null, newStatus: "PENDING_APPROVAL", idempotencyKey: "r1" });
   const records = await p.getAuditRecords(b.id);
-  assert.ok(records.some(r => r.booking_id === b.id && r.action === "BOOKING_CREATED" && r.new_status === "PENDING_APPROVAL"));
+  assert.ok(records.some(r => r.bookingKey === b.id && r.action === "BOOKING_CREATED" && r.newStatus === "PENDING_APPROVAL"));
 });
 
 test("notification failure after successful booking and audit: no rollback, booking/audit remain", async () => {
