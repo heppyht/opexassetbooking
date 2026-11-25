@@ -2,7 +2,7 @@
   "name": "opex-vehicle-booking",
   "private": true,
   "version": "0.1.0",
-  "workspaces": ["apps/web"],
+  "workspaces": ["apps/web", "apps/api"],
   "scripts": {
     "dev:web": "npm --workspace apps/web run dev",
     "build": "npm --workspace apps/web run build",

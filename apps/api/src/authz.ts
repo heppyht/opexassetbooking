@@ -299,8 +299,8 @@ export async function handleExecute(
         addInId,
         id: req.recordId,
         details: req.bookingData || {},
-        groups: req.bookingData?.groups
-          ? req.bookingData.groups
+        groups: Array.isArray(req.bookingData?.groups)
+          ? (req.bookingData.groups as Array<{ id: string }>)
           : [{ id: "GroupCompanyId" }],
       };
 
@@ -316,10 +316,12 @@ export async function handleExecute(
         };
       }
 
-      await addInDataRemove(env, serviceCreds, {
+      const removeInput: AddInDataRemoveInput = {
         addInId,
         id: req.recordId,
-      });
+      };
+
+      await addInDataRemove(env, serviceCreds, removeInput);
       resultId = req.recordId;
     } else {
       return {
